@@ -1,0 +1,12 @@
+version: 0.0
+Resources:
+  - TargetService:
+      Type: AWS::ECS::Service
+      Properties:
+        TaskDefinition: <TASK_DEFINITION>
+        LoadBalancerInfo:
+          ContainerName: "streamlit"
+          ContainerPort: 8501
+Hooks:
+  - BeforeInstall: "cicd/scripts/pre_deploy.sh"
+  - AfterInstall: "cicd/scripts/post_deploy.sh" 

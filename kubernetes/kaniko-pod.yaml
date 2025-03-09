@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${APP_NAME}-kaniko-builder
+  namespace: default
+spec:
+  serviceAccountName: kaniko-builder
+  restartPolicy: Never
+  containers:
+  - name: kaniko
+    image: gcr.io/kaniko-project/executor:latest
+    args:
+    - "--dockerfile=${DOCKERFILE_PATH}"
+    - "--context=s3://${S3_BUCKET}/${APP_NAME}.tar.gz"
+    - "--destination=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${APP_NAME}:${IMAGE_TAG}"
+    - "--cache=${ENABLE_CACHE}"
+    - "--cache-repo=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/kaniko-cache"
+    - "--cleanup"
+    env:
+    - name: AWS_SDK_LOAD_CONFIG
+      value: "true"
+    # When using AWS credentials (not IRSA), include volume mounts
+    volumeMounts:
+    - name: aws-credentials
+      mountPath: /kaniko/.aws
+  volumes:
+  - name: aws-credentials
+    secret:
+      secretName: aws-credentials
+      items:
+      - key: credentials
+        path: credentials
