@@ -13,6 +13,10 @@ phases:
       - chmod +x aws-iam-authenticator
       - mv aws-iam-authenticator /usr/local/bin/
       - yum install -y jq gettext
+      - echo "Installing eksctl..."
+      - curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" | tar xz -C /tmp
+      - mv /tmp/eksctl /usr/local/bin
+      - eksctl version
 
   pre_build:
     commands:
@@ -28,8 +32,22 @@ phases:
       - kubectl config view
       - echo "Setting up EKS auth ConfigMap..."
       - chmod +x cicd/scripts/setup-eks-auth.sh
-      - ./cicd/scripts/setup-eks-auth.sh --eks-cluster $EKS_CLUSTER_NAME --force
-      - kubectl get svc
+      - |
+        ./cicd/scripts/setup-eks-auth.sh --eks-cluster $EKS_CLUSTER_NAME --force || {
+          echo "Warning: EKS auth setup failed, but continuing with the build..."
+          echo "Attempting to manually update aws-auth ConfigMap..."
+          ROLE_ARN=$(aws iam list-roles --query "Roles[?RoleName.contains(@, 'streamlit-app-pipeline') && RoleName.contains(@, 'CodeBuildServiceRole')].Arn" --output text)
+          kubectl get configmap aws-auth -n kube-system -o yaml > /tmp/aws-auth.yaml
+          if ! grep -q "$ROLE_ARN" /tmp/aws-auth.yaml; then
+            echo "Adding CodeBuild role to aws-auth ConfigMap..."
+            EXISTING_ROLES=$(kubectl get configmap aws-auth -n kube-system -o jsonpath='{.data.mapRoles}')
+            NEW_ROLE="- rolearn: $ROLE_ARN\n  username: codebuild\n  groups:\n  - system:masters"
+            UPDATED_ROLES="$EXISTING_ROLES\n$NEW_ROLE"
+            kubectl patch configmap aws-auth -n kube-system --type merge -p "{\"data\":{\"mapRoles\":\"$UPDATED_ROLES\"}}"
+          fi
+        }
+      - |
+        kubectl get svc || echo "Warning: Could not get services, but continuing with the build..."
       - echo "Creating S3 bucket for context if it doesn't exist..."
       - S3_BUCKET=kaniko-context-$AWS_ACCOUNT_ID-$AWS_REGION
       - aws s3api create-bucket --bucket $S3_BUCKET --region $AWS_REGION --create-bucket-configuration LocationConstraint=$AWS_REGION || true

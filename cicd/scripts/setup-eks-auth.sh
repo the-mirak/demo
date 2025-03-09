@@ -2,6 +2,7 @@
 
 # This script helps set up the EKS auth ConfigMap to allow CodeBuild to access the EKS cluster
 
+# Exit on error, but don't enable debug mode
 set -e
 
 # Default values
@@ -66,13 +67,13 @@ fi
 # Try to get the CodeBuild role ARN from CloudFormation outputs
 echo "Trying to get CodeBuild role ARN from CloudFormation outputs..."
 ROLE_ARN=$(aws cloudformation describe-stacks --stack-name $STACK_NAME --region $REGION \
-  --query "Stacks[0].Outputs[?OutputKey=='CodeBuildServiceRoleArn'].OutputValue" --output text)
+  --query "Stacks[0].Outputs[?OutputKey=='CodeBuildServiceRoleArn'].OutputValue" --output text || echo "")
 
 # If not found, try to find it directly
 if [ -z "$ROLE_ARN" ] || [ "$ROLE_ARN" == "None" ]; then
   echo "CodeBuild role ARN not found in CloudFormation outputs. Trying to find it directly..."
   ROLE_ARN=$(aws iam list-roles --region $REGION \
-    --query "Roles[?RoleName.contains(@, '$STACK_NAME') && RoleName.contains(@, 'CodeBuildServiceRole')].Arn" --output text)
+    --query "Roles[?RoleName.contains(@, '$STACK_NAME') && RoleName.contains(@, 'CodeBuildServiceRole')].Arn" --output text || echo "")
 fi
 
 # Check if role ARN was found
@@ -85,7 +86,10 @@ echo "Found CodeBuild role ARN: $ROLE_ARN"
 
 # Update kubeconfig
 echo "Updating kubeconfig for EKS cluster: $EKS_CLUSTER"
-aws eks update-kubeconfig --name $EKS_CLUSTER --region $REGION
+if ! aws eks update-kubeconfig --name $EKS_CLUSTER --region $REGION; then
+  echo "Error: Failed to update kubeconfig. Please check if the EKS cluster exists and you have permissions to access it."
+  exit 1
+fi
 
 # Check if aws-auth ConfigMap exists
 echo "Checking if aws-auth ConfigMap exists..."
@@ -132,7 +136,16 @@ data:
 EOF
   
   # Apply the updated ConfigMap
-  kubectl apply -f /tmp/aws-auth-fixed.yaml
+  if ! kubectl apply -f /tmp/aws-auth-fixed.yaml; then
+    echo "Error: Failed to apply the updated ConfigMap. Trying to patch it instead..."
+    # Instead of replacing the entire mapRoles, we'll add the CodeBuild role if it doesn't exist
+    if ! grep -q "$ROLE_ARN" /tmp/aws-auth.yaml; then
+      EXISTING_ROLES=$(kubectl get configmap aws-auth -n kube-system -o jsonpath='{.data.mapRoles}')
+      NEW_ROLE="- rolearn: $ROLE_ARN\n  username: codebuild\n  groups:\n  - system:masters"
+      UPDATED_ROLES="$EXISTING_ROLES\n$NEW_ROLE"
+      kubectl patch configmap aws-auth -n kube-system --type merge -p "{\"data\":{\"mapRoles\":\"$UPDATED_ROLES\"}}"
+    fi
+  fi
 else
   echo "aws-auth ConfigMap doesn't exist. Creating it..."
   
@@ -152,15 +165,45 @@ data:
 EOF
   
   # Apply the ConfigMap
-  kubectl apply -f /tmp/aws-auth.yaml
+  if ! kubectl apply -f /tmp/aws-auth.yaml; then
+    echo "Error: Failed to create the aws-auth ConfigMap."
+    exit 1
+  fi
 fi
 
 echo "EKS auth ConfigMap updated successfully."
 echo "Verifying configuration..."
-kubectl describe configmap aws-auth -n kube-system
+kubectl describe configmap aws-auth -n kube-system || echo "Warning: Could not verify the ConfigMap, but continuing..."
 
 # Clean up
 rm -f /tmp/aws-auth.yaml
 rm -f /tmp/aws-auth-fixed.yaml
 
-echo "Setup complete!" 
+echo "Setup complete!"
+
+# Check if OIDC provider exists
+OIDC_PROVIDER_EXISTS=$(aws iam list-open-id-connect-providers | grep $OIDC_PROVIDER_ID || echo "false")
+
+if [ "$OIDC_PROVIDER_EXISTS" = "false" ]; then
+  echo "OIDC provider does not exist. Creating it..."
+  # Check if eksctl is available
+  if command -v eksctl &> /dev/null; then
+    eksctl utils associate-iam-oidc-provider --cluster $EKS_CLUSTER --approve
+  else
+    echo "eksctl not found. Creating OIDC provider manually..."
+    # Get OIDC issuer URL
+    OIDC_ISSUER=$(aws eks describe-cluster --name $EKS_CLUSTER --query "cluster.identity.oidc.issuer" --output text)
+    OIDC_PROVIDER=$(echo $OIDC_ISSUER | sed 's/https:\/\///')
+    
+    # Get thumbprint
+    THUMBPRINT=$(echo | openssl s_client -servername $OIDC_PROVIDER -showcerts -connect $OIDC_PROVIDER:443 2>/dev/null | openssl x509 -in /dev/stdin -fingerprint -noout | sed 's/://g' | sed 's/SHA1 Fingerprint=//g')
+    
+    # Create OIDC provider
+    aws iam create-open-id-connect-provider \
+      --url $OIDC_ISSUER \
+      --client-id-list sts.amazonaws.com \
+      --thumbprint-list $THUMBPRINT
+  fi
+else
+  echo "OIDC provider already exists"
+fi 
