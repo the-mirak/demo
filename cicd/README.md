@@ -76,7 +76,7 @@ We've provided a convenient script to deploy the CloudFormation stack:
 ./cicd/scripts/deploy_pipeline.sh \
   --github-owner  the-mirak \
   --github-repo demo \
-  --github-token  \
+  --github-token <token> \
   --eks-cluster eks-workshop \
   --region us-west-2
 ```
