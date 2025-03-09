@@ -280,4 +280,19 @@ This is because AWS CodePipeline has a 100-character limit for GitHub OAuth toke
 
 This approach allows you to use GitHub tokens of any length while still maintaining compatibility with CodePipeline.
 
+### CodeBuild Environment Issues
+
+If you encounter an error like:
+```
+[Container] Phase context status code: COMMAND_EXECUTION_ERROR Message: Error while executing command: apt-get update && apt-get install -y jq. Reason: exit status 127
+```
+
+This is because the CodeBuild environment is using Amazon Linux, which uses `yum` instead of `apt-get` for package management. The template and buildspec have been updated to:
+
+1. Use the latest Amazon Linux 2 image (`aws/codebuild/amazonlinux2-x86_64-standard:4.0`)
+2. Use `yum` instead of `apt-get` for package installation
+3. Include all necessary packages like `jq` and `gettext` (for `envsubst`)
+
+If you encounter similar errors with other commands, make sure they're compatible with the Amazon Linux environment.
+
 For additional help, please open an issue in the GitHub repository. 
