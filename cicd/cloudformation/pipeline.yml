@@ -28,31 +28,144 @@ Parameters:
     Type: String
     Default: us-west-2
     Description: AWS Region for resources
+    
+  CreateECRRepository:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Whether to create a new ECR repository (set to false if it already exists)
+
+Conditions:
+  ShouldCreateECRRepository: !Equals [!Ref CreateECRRepository, 'true']
 
 Resources:
-  # ECR Repository
-  ECRRepository:
-    Type: AWS::ECR::Repository
+  # Store GitHub token in Secrets Manager
+  GitHubTokenSecret:
+    Type: AWS::SecretsManager::Secret
     Properties:
+      Name: !Sub '${AWS::StackName}-github-token'
+      Description: 'GitHub OAuth token for CodePipeline'
+      SecretString: !Ref GitHubToken
+
+  # Lambda execution role for the custom resource
+  ECRCheckLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: ECRAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ecr:DescribeRepositories'
+                  - 'ecr:CreateRepository'
+                  - 'ecr:PutLifecyclePolicy'
+                Resource: '*'
+
+  # Lambda function to check if ECR repository exists
+  ECRCheckLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt ECRCheckLambdaRole.Arn
+      Runtime: python3.9
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          
+          def handler(event, context):
+            try:
+              # Extract properties from the event
+              props = event['ResourceProperties']
+              repository_name = props.get('RepositoryName', 'streamlit-app')
+              lifecycle_policy = props.get('LifecyclePolicy', '')
+              
+              # Initialize ECR client
+              ecr = boto3.client('ecr')
+              
+              # Check if we're creating, updating, or deleting
+              if event['RequestType'] == 'Delete':
+                # Don't delete the repository on stack deletion
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                return
+              
+              # Check if repository exists
+              try:
+                response = ecr.describe_repositories(repositoryNames=[repository_name])
+                # Repository exists
+                repository_uri = response['repositories'][0]['repositoryUri']
+                
+                # If updating, we could update the lifecycle policy here
+                if event['RequestType'] == 'Update' and lifecycle_policy:
+                  ecr.put_lifecycle_policy(
+                    repositoryName=repository_name,
+                    lifecyclePolicyText=lifecycle_policy
+                  )
+                
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                  'RepositoryUri': repository_uri,
+                  'RepositoryName': repository_name,
+                  'RepositoryExists': 'true'
+                })
+              except ecr.exceptions.RepositoryNotFoundException:
+                # Repository doesn't exist, create it
+                response = ecr.create_repository(repositoryName=repository_name)
+                repository_uri = response['repository']['repositoryUri']
+                
+                # Apply lifecycle policy if provided
+                if lifecycle_policy:
+                  ecr.put_lifecycle_policy(
+                    repositoryName=repository_name,
+                    lifecyclePolicyText=lifecycle_policy
+                  )
+                
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                  'RepositoryUri': repository_uri,
+                  'RepositoryName': repository_name,
+                  'RepositoryExists': 'false'
+                })
+            except Exception as e:
+              print(f"Error: {str(e)}")
+              cfnresponse.send(event, context, cfnresponse.FAILED, {
+                'Error': str(e)
+              })
+
+  # Custom resource that uses the Lambda function
+  ECRRepository:
+    Type: Custom::ECRRepository
+    Properties:
+      ServiceToken: !GetAtt ECRCheckLambda.Arn
       RepositoryName: streamlit-app
-      LifecyclePolicy:
-        LifecyclePolicyText: |
-          {
-            "rules": [
-              {
-                "rulePriority": 1,
-                "description": "Keep only the last 10 images",
-                "selection": {
-                  "tagStatus": "any",
-                  "countType": "imageCountMoreThan",
-                  "countNumber": 10
-                },
-                "action": {
-                  "type": "expire"
-                }
+      LifecyclePolicy: |
+        {
+          "rules": [
+            {
+              "rulePriority": 1,
+              "description": "Keep only the last 10 images",
+              "selection": {
+                "tagStatus": "any",
+                "countType": "imageCountMoreThan",
+                "countNumber": 10
+              },
+              "action": {
+                "type": "expire"
               }
-            ]
-          }
+            }
+          ]
+        }
 
   # CodeBuild Service Role
   CodeBuildServiceRole:
@@ -66,7 +179,6 @@ Resources:
               Service: codebuild.amazonaws.com
             Action: 'sts:AssumeRole'
       ManagedPolicyArns:
-        - 'arn:aws:iam::aws:policy/AmazonECR-FullAccess'
         - 'arn:aws:iam::aws:policy/AmazonEKSClusterPolicy'
       Policies:
         - PolicyName: CodeBuildServiceRolePolicy
@@ -96,13 +208,26 @@ Resources:
                   - 'ecr:UploadLayerPart'
                   - 'ecr:CompleteLayerUpload'
                   - 'ecr:PutImage'
+                  - 'ecr:CreateRepository'
+                  - 'ecr:DescribeRepositories'
+                  - 'ecr:ListImages'
+                  - 'ecr:DeleteRepository'
+                  - 'ecr:BatchDeleteImage'
+                  - 'ecr:SetRepositoryPolicy'
+                  - 'ecr:TagResource'
+                  - 'ecr:PutLifecyclePolicy'
                 Resource: '*'
               - Effect: Allow
                 Action:
                   - 's3:GetObject'
                   - 's3:GetObjectVersion'
                   - 's3:PutObject'
-                Resource: !Sub 'arn:aws:s3:::${ArtifactBucket}/*'
+                  - 's3:CreateBucket'
+                Resource: 
+                  - !Sub 'arn:aws:s3:::${ArtifactBucket}/*'
+                  - !Sub 'arn:aws:s3:::${ArtifactBucket}'
+                  - !Sub 'arn:aws:s3:::kaniko-context-${AWS::AccountId}-${AWSRegion}/*'
+                  - !Sub 'arn:aws:s3:::kaniko-context-${AWS::AccountId}-${AWSRegion}'
 
   # CodePipeline Service Role
   CodePipelineServiceRole:
@@ -136,6 +261,92 @@ Resources:
                   - 'codebuild:StartBuild'
                   - 'codebuild:BatchGetBuilds'
                 Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'secretsmanager:GetSecretValue'
+                Resource: !Ref GitHubTokenSecret
+
+  # Lambda function to create a CodeStar connection
+  GitHubConnectionLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt GitHubConnectionLambdaRole.Arn
+      Runtime: python3.9
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          import os
+          
+          def handler(event, context):
+            try:
+              # Extract properties from the event
+              props = event['ResourceProperties']
+              secret_arn = props.get('SecretArn', '')
+              owner = props.get('Owner', '')
+              repo = props.get('Repo', '')
+              branch = props.get('Branch', 'main')
+              
+              # Initialize clients
+              secretsmanager = boto3.client('secretsmanager')
+              
+              # If deleting, just return success
+              if event['RequestType'] == 'Delete':
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                return
+              
+              # Get the GitHub token from Secrets Manager
+              response = secretsmanager.get_secret_value(SecretId=secret_arn)
+              token = response['SecretString']
+              
+              # Return the values needed for the CodePipeline source action
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                'Owner': owner,
+                'Repo': repo,
+                'Branch': branch,
+                'OAuthToken': token[:100]  # Truncate to 100 chars for CodePipeline
+              })
+            except Exception as e:
+              print(f"Error: {str(e)}")
+              cfnresponse.send(event, context, cfnresponse.FAILED, {
+                'Error': str(e)
+              })
+
+  # IAM role for the GitHub connection Lambda
+  GitHubConnectionLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'secretsmanager:GetSecretValue'
+                Resource: !Ref GitHubTokenSecret
+
+  # Custom resource to handle GitHub connection
+  GitHubConnection:
+    Type: Custom::GitHubConnection
+    Properties:
+      ServiceToken: !GetAtt GitHubConnectionLambda.Arn
+      SecretArn: !Ref GitHubTokenSecret
+      Owner: !Ref GitHubOwner
+      Repo: !Ref GitHubRepo
+      Branch: !Ref GitHubBranch
 
   # S3 Bucket for Artifacts
   ArtifactBucket:
@@ -192,10 +403,10 @@ Resources:
                 Provider: GitHub
                 Version: '1'
               Configuration:
-                Owner: !Ref GitHubOwner
-                Repo: !Ref GitHubRepo
-                Branch: !Ref GitHubBranch
-                OAuthToken: !Ref GitHubToken
+                Owner: !GetAtt GitHubConnection.Owner
+                Repo: !GetAtt GitHubConnection.Repo
+                Branch: !GetAtt GitHubConnection.Branch
+                OAuthToken: !GetAtt GitHubConnection.OAuthToken
               OutputArtifacts:
                 - Name: SourceCode
         - Name: Build
@@ -218,4 +429,4 @@ Outputs:
   
   ECRRepositoryURL:
     Description: URL of the ECR Repository
-    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}' 
+    Value: !GetAtt ECRRepository.RepositoryUri 

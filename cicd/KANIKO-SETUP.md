@@ -23,7 +23,7 @@ If you haven't already set up an OIDC provider for your EKS cluster, you'll need
 
 ```bash
 # Get your EKS cluster's OIDC provider URL
-OIDC_PROVIDER=$(aws eks describe-cluster --name YOUR_CLUSTER_NAME --query "cluster.identity.oidc.issuer" --output text | sed 's/https:\/\///')
+OIDC_PROVIDER=$(aws eks describe-cluster --name eks-workshop --query "cluster.identity.oidc.issuer" --output text | sed 's/https:\/\///')
 
 # Create the OIDC provider in IAM
 aws iam create-open-id-connect-provider \

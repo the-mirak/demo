@@ -27,7 +27,7 @@ Before setting up the CI/CD pipeline, ensure you have:
 
 ## Directory Structure
 
-```
+```sh
 cicd/
 ├── buildspec/
 │   └── buildspec.yml         # AWS CodeBuild buildspec file
@@ -46,7 +46,8 @@ cicd/
 
 1. Push your Streamlit application code to a GitHub repository
 2. Ensure your repository has the following structure:
-   ```
+
+ ```sh
    repo-root/
    ├── app/
    │   ├── Dockerfile
@@ -57,7 +58,7 @@ cicd/
    ├── cicd/
    │   └── ... (the contents of this directory)
    └── appspec.yml
-   ```
+```
 
 3. Generate a GitHub personal access token:
    - Go to GitHub Settings > Developer settings > Personal access tokens
@@ -74,8 +75,8 @@ We've provided a convenient script to deploy the CloudFormation stack:
 ```bash
 ./cicd/scripts/deploy_pipeline.sh \
   --github-owner  the-mirak \
-  --github-repo streamlit-demo-app \
-  --github-token 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 \
+  --github-repo demo \
+  --github-token  \
   --eks-cluster eks-workshop \
   --region us-west-2
 ```
@@ -112,6 +113,7 @@ chmod +x cicd/scripts/deploy_pipeline.sh
 Ensure that CodeBuild has the necessary permissions to deploy to your EKS cluster:
 
 1. Get the ARN of the CodeBuild service role:
+
    ```bash
    aws cloudformation describe-stacks --stack-name streamlit-app-pipeline \
      --query "Stacks[0].Outputs[?OutputKey=='CodeBuildServiceRoleArn'].OutputValue" \
@@ -119,11 +121,13 @@ Ensure that CodeBuild has the necessary permissions to deploy to your EKS cluste
    ```
 
 2. Add the role to your EKS cluster's auth config:
+
    ```bash
    kubectl edit configmap aws-auth -n kube-system
    ```
 
 3. Add the following entry to the `mapRoles` section:
+
    ```yaml
    - rolearn: <CodeBuild-Service-Role-ARN>
      username: codebuild
@@ -154,6 +158,7 @@ Ensure that CodeBuild has the necessary permissions to deploy to your EKS cluste
 ### Checking Deployment Status
 
 1. Use kubectl to check the deployment status:
+
    ```bash
    kubectl get deployments
    kubectl get pods
@@ -161,6 +166,7 @@ Ensure that CodeBuild has the necessary permissions to deploy to your EKS cluste
    ```
 
 2. To view the logs of the running pods:
+
    ```bash
    kubectl logs -l app=streamlit-app
    ```
@@ -212,4 +218,66 @@ kubectl delete -f kubernetes/streamlit-deployment.yaml
 
 ## Support
 
-For issues or questions, please open an issue in the GitHub repository. 
+For issues or questions, please open an issue in the GitHub repository.
+
+## Troubleshooting
+
+### ECR Repository Management
+
+The CloudFormation template now uses a custom resource to intelligently handle ECR repositories:
+
+- **Automatic Detection**: The template automatically checks if the ECR repository exists
+- **Smart Creation**: If the repository doesn't exist, it creates it; if it exists, it uses the existing one
+- **Lifecycle Management**: It applies the lifecycle policy to manage image retention
+- **Safe Deletion**: When the stack is deleted, the ECR repository is preserved
+
+This approach eliminates the "Resource already exists" error that previously occurred when the ECR repository was created outside of CloudFormation or by a previous deployment.
+
+### Other Common Issues
+
+If you encounter other issues with the deployment:
+
+1. Check the CloudFormation events for detailed error messages
+2. Review the CodeBuild logs for build and deployment errors
+3. Verify that the IAM roles have the necessary permissions
+4. Ensure your GitHub token has the required scopes and hasn't expired
+
+### IAM Policy Names
+
+If you encounter errors like:
+```
+Resource handler returned message: "Policy arn:aws:iam::aws:policy/AmazonECR-FullAccess does not exist or is not attachable."
+```
+or
+```
+Resource handler returned message: "Policy arn:aws:iam::aws:policy/AmazonECRFullAccess does not exist or is not attachable."
+```
+
+This is because AWS occasionally updates, renames, or deprecates their managed policies. The template has been updated to use inline policies instead of managed policies for ECR access, which provides several benefits:
+
+1. **Independence from AWS Policy Changes**: The template is no longer affected by AWS renaming or deprecating managed policies
+2. **Precise Permissions**: Only the exact permissions needed are granted
+3. **Better Security**: Following the principle of least privilege by specifying exact permissions
+
+If you encounter similar errors with other managed policies:
+
+1. Replace the managed policy reference with an inline policy that includes the necessary permissions
+2. Check the [AWS Documentation](https://docs.aws.amazon.com/service-authorization/latest/reference/reference_policies_actions-resources-contextkeys.html) for the specific actions needed
+3. Re-deploy the stack
+
+### GitHub Token Length Limitation
+
+If you encounter an error like:
+```
+Resource handler returned message: "The OAuth token used for the GitHub source action Source exceeds the maximum allowed length of 100 characters."
+```
+
+This is because AWS CodePipeline has a 100-character limit for GitHub OAuth tokens. The template has been updated to handle this limitation by:
+
+1. Storing the full token in AWS Secrets Manager
+2. Using a Lambda function to retrieve the token and truncate it to 100 characters for CodePipeline
+3. Passing the truncated token to the GitHub source action
+
+This approach allows you to use GitHub tokens of any length while still maintaining compatibility with CodePipeline.
+
+For additional help, please open an issue in the GitHub repository. 
