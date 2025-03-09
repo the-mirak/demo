@@ -16,53 +16,53 @@ phases:
 
   pre_build:
     commands:
-      - echo Setting up environment variables...
+      - echo "Setting up environment variables..."
       - REPOSITORY_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/streamlit-app
       - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
       - IMAGE_TAG=${COMMIT_HASH:=latest}
       - APP_NAME=streamlit-app
       - DOCKERFILE_PATH=Dockerfile
       - ENABLE_CACHE=true
-      - echo Updating kubeconfig...
+      - echo "Updating kubeconfig..."
       - aws eks update-kubeconfig --name $EKS_CLUSTER_NAME --region $AWS_REGION --output text
-      - echo Creating S3 bucket for context if it doesn't exist...
+      - echo "Creating S3 bucket for context if it doesn't exist..."
       - S3_BUCKET=kaniko-context-$AWS_ACCOUNT_ID-$AWS_REGION
       - aws s3api create-bucket --bucket $S3_BUCKET --region $AWS_REGION --create-bucket-configuration LocationConstraint=$AWS_REGION || true
-      - echo Preparing application context...
+      - echo "Preparing application context..."
       - tar -czf /tmp/$APP_NAME.tar.gz -C app .
       - aws s3 cp /tmp/$APP_NAME.tar.gz s3://$S3_BUCKET/
-      - echo Running pre-deployment script...
+      - echo "Running pre-deployment script..."
       - chmod +x cicd/scripts/pre_deploy.sh
       - ./cicd/scripts/pre_deploy.sh
 
   build:
     commands:
-      - echo Build started on `date`
-      - echo Building the container image using Kaniko...
-      - echo Applying Kaniko service account...
+      - echo "Build started on $(date)"
+      - echo "Building the container image using Kaniko..."
+      - echo "Applying Kaniko service account..."
       - envsubst < kubernetes/kaniko-service-account.yaml > kubernetes/kaniko-service-account-updated.yaml
       - kubectl apply -f kubernetes/kaniko-service-account-updated.yaml
-      - echo Creating Kaniko pod...
+      - echo "Creating Kaniko pod..."
       - envsubst < kubernetes/kaniko-pod.yaml > kubernetes/kaniko-pod-updated.yaml
       - kubectl apply -f kubernetes/kaniko-pod-updated.yaml
-      - echo Waiting for Kaniko pod to complete...
+      - echo "Waiting for Kaniko pod to complete..."
       - kubectl wait --for=condition=Ready pod/${APP_NAME}-kaniko-builder --timeout=60s || true
       - kubectl logs -f ${APP_NAME}-kaniko-builder
-      - echo Waiting for Kaniko build to complete...
+      - echo "Waiting for Kaniko build to complete..."
       - until kubectl get pod ${APP_NAME}-kaniko-builder -o jsonpath='{.status.phase}' | grep -q "Succeeded"; do sleep 5; done
 
   post_build:
     commands:
-      - echo Build completed on `date`
-      - echo Update Kubernetes deployment...
+      - echo "Build completed on $(date)"
+      - echo "Update Kubernetes deployment..."
       - envsubst < kubernetes/streamlit-deployment.yaml > kubernetes/streamlit-deployment-updated.yaml
       - kubectl apply -f kubernetes/streamlit-deployment-updated.yaml
-      - echo Waiting for deployment to stabilize...
+      - echo "Waiting for deployment to stabilize..."
       - kubectl rollout status deployment/streamlit-app --timeout=300s
-      - echo Cleaning up Kaniko pod...
+      - echo "Cleaning up Kaniko pod..."
       - kubectl delete pod ${APP_NAME}-kaniko-builder
-      - echo Deployment completed successfully!
-      - echo Running post-deployment verification...
+      - echo "Deployment completed successfully!"
+      - echo "Running post-deployment verification..."
       - chmod +x cicd/scripts/post_deploy.sh
       - ./cicd/scripts/post_deploy.sh
 

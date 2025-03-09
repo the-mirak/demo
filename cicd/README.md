@@ -295,4 +295,24 @@ This is because the CodeBuild environment is using Amazon Linux, which uses `yum
 
 If you encounter similar errors with other commands, make sure they're compatible with the Amazon Linux environment.
 
+### Shell Script Syntax Issues
+
+If you encounter an error like:
+```
+/codebuild/output/tmp/script.sh: line 4: unexpected EOF while looking for matching `''
+```
+
+This is typically caused by syntax errors in the buildspec.yml file, such as:
+
+1. **Unmatched Quotes**: Missing closing quotes in echo statements or commands
+2. **Backtick Issues**: Problems with backtick (`) characters in commands
+3. **Special Character Escaping**: Improper escaping of special characters
+
+The buildspec has been updated to:
+1. Use double quotes consistently for all echo statements
+2. Replace backticks with `$(command)` syntax for command substitution
+3. Ensure proper escaping of special characters
+
+If you encounter similar syntax errors, check your buildspec.yml for these common issues.
+
 For additional help, please open an issue in the GitHub repository. 
