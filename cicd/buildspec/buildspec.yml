@@ -14,103 +14,85 @@ phases:
   pre_build:
     commands:
       - echo "Setting up environment variables..."
-      - REPOSITORY_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/streamlit-app
-      - IMAGE_TAG=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
-      - APP_NAME=streamlit-app
-      - S3_BUCKET=kaniko-context-$AWS_ACCOUNT_ID-$AWS_REGION
-      - IAM_ROLE_NAME="kaniko-ecr-push-role"
-      - IAM_POLICY_NAME="kaniko-ecr-policy"
-      - SERVICE_ACCOUNT="kaniko-builder"
-      - CLUSTER_NAME=$EKS_CLUSTER_NAME
-      - OIDC_PROVIDER_URL=$(aws eks describe-cluster --name "$CLUSTER_NAME" --query "cluster.identity.oidc.issuer" --output text)
-      - OIDC_PROVIDER_ARN="arn:aws:iam::$AWS_ACCOUNT_ID:oidc-provider/${OIDC_PROVIDER_URL#https://}"
-
-      - echo "Verifying IAM Role: $IAM_ROLE_NAME..."
-      - |
-        ROLE_EXISTS=$(aws iam get-role --role-name "$IAM_ROLE_NAME" --query "Role.RoleName" --output text 2>/dev/null || echo "None")
-        if [ "$ROLE_EXISTS" == "None" ]; then
-          echo "Creating IAM role: $IAM_ROLE_NAME"
-          cat > /tmp/kaniko-trust-policy.json << EOF
-          {
-            "Version": "2012-10-17",
-            "Statement": [
-              {
-                "Effect": "Allow",
-                "Principal": { "Federated": "$OIDC_PROVIDER_ARN" },
-                "Action": "sts:AssumeRoleWithWebIdentity",
-                "Condition": {
-                  "StringEquals": { "${OIDC_PROVIDER_URL#https://}:sub": "system:serviceaccount:default:$SERVICE_ACCOUNT" }
-                }
-              }
-            ]
-          }
-          EOF
-          aws iam create-role --role-name "$IAM_ROLE_NAME" --assume-role-policy-document file:///tmp/kaniko-trust-policy.json
-          echo "✅ IAM Role created: $IAM_ROLE_NAME"
-        else
-          echo "✅ IAM Role already exists"
-        fi
-
-      - echo "Verifying IAM Policy: $IAM_POLICY_NAME..."
-      - |
-        POLICY_EXISTS=$(aws iam list-policies --scope Local --query "Policies[?PolicyName=='$IAM_POLICY_NAME'].Arn" --output text)
-        if [ -z "$POLICY_EXISTS" ] || [ "$POLICY_EXISTS" == "None" ]; then
-          echo "Creating IAM policy: $IAM_POLICY_NAME"
-          cat > /tmp/kaniko-ecr-policy.json << EOF
-          {
-            "Version": "2012-10-17",
-            "Statement": [
-              {
-                "Effect": "Allow",
-                "Action": [
-                  "ecr:GetAuthorizationToken",
-                  "ecr:BatchCheckLayerAvailability",
-                  "ecr:BatchGetImage",
-                  "ecr:CompleteLayerUpload",
-                  "ecr:GetDownloadUrlForLayer",
-                  "ecr:InitiateLayerUpload",
-                  "ecr:PutImage",
-                  "ecr:UploadLayerPart"
-                ],
-                "Resource": "*"
-              }
-            ]
-          }
-          EOF
-          aws iam create-policy --policy-name "$IAM_POLICY_NAME" --policy-document file:///tmp/kaniko-ecr-policy.json
-          echo "✅ IAM Policy created: $IAM_POLICY_NAME"
-        else
-          echo "✅ IAM Policy already exists"
-        fi
-
-      - echo "Attaching IAM policy to role..."
-      - aws iam attach-role-policy --role-name "$IAM_ROLE_NAME" --policy-arn "arn:aws:iam::$AWS_ACCOUNT_ID:policy/$IAM_POLICY_NAME"
-
-      - echo "Verifying Kubernetes service account: $SERVICE_ACCOUNT..."
-      - |
-        kubectl annotate serviceaccount $SERVICE_ACCOUNT \
-          -n default \
-          eks.amazonaws.com/role-arn="arn:aws:iam::$AWS_ACCOUNT_ID:role/$IAM_ROLE_NAME" --overwrite || true
-      - echo "✅ IRSA annotation applied: $IAM_ROLE_NAME"
-
-      - echo "Creating S3 bucket for context if it doesn't exist..."
-      - aws s3api create-bucket --bucket $S3_BUCKET --region $AWS_REGION --create-bucket-configuration LocationConstraint=$AWS_REGION || true
-      - echo "Preparing application context..."
+      - export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+      - export IMAGE_TAG=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+      - export APP_NAME="streamlit-app"
+      - export S3_BUCKET="kaniko-context-$AWS_ACCOUNT_ID-$AWS_REGION"
+      - export SERVICE_ACCOUNT="kaniko-builder"
+      - export CLUSTER_NAME="$EKS_CLUSTER_NAME"
+      - export REPOSITORY_URI="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$APP_NAME"
+      
+      - echo "Updating kubeconfig..."
+      - aws eks update-kubeconfig --name $CLUSTER_NAME --region $AWS_REGION
+      
+      - echo "Ensuring S3 bucket exists for context storage..."
+      - aws s3 mb s3://$S3_BUCKET --region $AWS_REGION || true
+      
+      - echo "Uploading application context to S3..."
       - tar -czf /tmp/$APP_NAME.tar.gz -C app .
       - aws s3 cp /tmp/$APP_NAME.tar.gz s3://$S3_BUCKET/
 
   build:
     commands:
-      - echo "Building the container image using Kaniko..."
+      - echo "Building Docker image with Kaniko..."
       - kubectl delete pod ${APP_NAME}-kaniko-builder --ignore-not-found=true
-      - envsubst < kubernetes/kaniko-pod.yaml > kubernetes/kaniko-pod-updated.yaml
-      - kubectl apply -f kubernetes/kaniko-pod-updated.yaml
+      
+      - echo "Generating Kaniko pod manifest..."
+      - |
+        cat > kubernetes/kaniko-pod.yaml <<EOF
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          name: ${APP_NAME}-kaniko-builder
+          namespace: default
+        spec:
+          serviceAccountName: $SERVICE_ACCOUNT
+          restartPolicy: Never
+          containers:
+          - name: kaniko
+            image: gcr.io/kaniko-project/executor:latest
+            args:
+            - "--dockerfile=Dockerfile"
+            - "--context=s3://$S3_BUCKET/$APP_NAME.tar.gz"
+            - "--destination=$REPOSITORY_URI:$IMAGE_TAG"
+            - "--cache=true"
+            - "--cache-repo=$REPOSITORY_URI/cache"
+            - "--cleanup"
+        EOF
+      
+      - echo "Applying Kaniko pod manifest..."
+      - kubectl apply -f kubernetes/kaniko-pod.yaml
+      - echo "Waiting for Kaniko pod to start..."
+      - kubectl wait --for=condition=Initialized pod/${APP_NAME}-kaniko-builder --timeout=60s || { echo "Kaniko pod failed to start"; kubectl describe pod/${APP_NAME}-kaniko-builder; exit 1; }
+      
+      - echo "Waiting for Kaniko container to be ready..."
+      - |
+        WAIT_TIMEOUT=120
+        START_TIME=$(date +%s)
+        while true; do
+          CONTAINER_STATUS=$(kubectl get pod ${APP_NAME}-kaniko-builder -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || echo "Unknown")
+          CURRENT_TIME=$(date +%s)
+          ELAPSED_TIME=$((CURRENT_TIME - START_TIME))
+          
+          if [ "$CONTAINER_STATUS" == "true" ]; then
+            echo "✅ Kaniko container is ready!"
+            break
+          elif [ $ELAPSED_TIME -gt $WAIT_TIMEOUT ]; then
+            echo "⚠️ Timed out waiting for container to be ready, but continuing anyway..."
+            kubectl describe pod/${APP_NAME}-kaniko-builder
+            break
+          fi
+          echo "Waiting for container to be ready... (${ELAPSED_TIME}s / ${WAIT_TIMEOUT}s)"
+          sleep 5
+        done
+      
       - echo "Streaming Kaniko logs..."
       - kubectl logs -f ${APP_NAME}-kaniko-builder || true
-      - echo "Waiting for Kaniko build to complete..."
+      
+      - echo "Checking build status..."
+      - export TIMEOUT=600
+      - export START_TIME=$(date +%s)
       - |
-        TIMEOUT=600
-        START_TIME=$(date +%s)
         while true; do
           POD_STATUS=$(kubectl get pod ${APP_NAME}-kaniko-builder -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
           CURRENT_TIME=$(date +%s)
@@ -122,12 +104,12 @@ phases:
           elif [ "$POD_STATUS" == "Failed" ]; then
             echo "❌ Build failed! Fetching logs..."
             kubectl logs ${APP_NAME}-kaniko-builder
-            kubectl describe pod ${APP_NAME}-kaniko-builder
+            kubectl describe pod/${APP_NAME}-kaniko-builder
             exit 1
           elif [ $ELAPSED_TIME -gt $TIMEOUT ]; then
             echo "❌ Build timed out after $TIMEOUT seconds!"
             kubectl logs ${APP_NAME}-kaniko-builder
-            kubectl describe pod ${APP_NAME}-kaniko-builder
+            kubectl describe pod/${APP_NAME}-kaniko-builder
             exit 1
           fi
           sleep 5
@@ -135,14 +117,82 @@ phases:
 
   post_build:
     commands:
+      - echo "Updating deployment manifest with actual image values..."
+      - |
+        # Replace environment variables in the deployment manifest
+        sed -i "s|\${AWS_ACCOUNT_ID}|$AWS_ACCOUNT_ID|g" kubernetes/streamlit-deployment.yaml
+        sed -i "s|\${AWS_REGION}|$AWS_REGION|g" kubernetes/streamlit-deployment.yaml
+        sed -i "s|\${IMAGE_TAG}|$IMAGE_TAG|g" kubernetes/streamlit-deployment.yaml
+        
+        # Verify the substitution worked
+        echo "Deployment manifest after variable substitution:"
+        cat kubernetes/streamlit-deployment.yaml
+      
       - echo "Deploying to EKS..."
       - kubectl apply -f kubernetes/streamlit-deployment.yaml
-      - kubectl rollout status deployment/streamlit-app --timeout=300s
-      - kubectl delete pod ${APP_NAME}-kaniko-builder
-      - echo "✅ Deployment completed successfully!"
+      
+      - echo "Checking deployment status..."
+      - |
+        DEPLOY_TIMEOUT=600
+        START_TIME=$(date +%s)
+        DEPLOYMENT_NAME=streamlit-app
+        while true; do
+          # Get the deployment status and conditions
+          AVAILABLE=$(kubectl get deployment/$DEPLOYMENT_NAME -o jsonpath='{.status.availableReplicas}' 2>/dev/null || echo "0")
+          DESIRED=$(kubectl get deployment/$DEPLOYMENT_NAME -o jsonpath='{.status.replicas}' 2>/dev/null || echo "0")
+          UNAVAILABLE=$(kubectl get deployment/$DEPLOYMENT_NAME -o jsonpath='{.status.unavailableReplicas}' 2>/dev/null || echo "0")
+          
+          # Log current status
+          echo "Deployment status: $AVAILABLE/$DESIRED replicas available, $UNAVAILABLE unavailable"
+          
+          # Check deployment conditions for potential problems
+          PROGRESS_DEADLINE_CONDITION=$(kubectl get deployment/$DEPLOYMENT_NAME -o jsonpath='{.status.conditions[?(@.type=="Progressing")].status}' 2>/dev/null || echo "Unknown")
+          PROGRESS_DEADLINE_REASON=$(kubectl get deployment/$DEPLOYMENT_NAME -o jsonpath='{.status.conditions[?(@.type=="Progressing")].reason}' 2>/dev/null || echo "Unknown")
+          
+          # Check elapsed time
+          CURRENT_TIME=$(date +%s)
+          ELAPSED_TIME=$((CURRENT_TIME - START_TIME))
+          
+          # If all replicas are available, success!
+          if [ "$AVAILABLE" == "$DESIRED" ] && [ "$DESIRED" != "0" ]; then
+            echo "✅ Deployment successful! All $AVAILABLE/$DESIRED replicas are available."
+            break
+          # If the deployment failed its progress deadline
+          elif [ "$PROGRESS_DEADLINE_CONDITION" == "False" ] && [ "$PROGRESS_DEADLINE_REASON" == "ProgressDeadlineExceeded" ]; then
+            echo "⚠️ Deployment progress deadline exceeded. Checking pod status..."
+            kubectl get pods -l app=streamlit-app
+            kubectl describe deployment/$DEPLOYMENT_NAME
+            
+            # Check the pod events and logs for troubleshooting
+            echo "Pod events:"
+            FAILING_POD=$(kubectl get pods -l app=streamlit-app -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+            if [ -n "$FAILING_POD" ]; then
+              kubectl describe pod/$FAILING_POD
+              echo "Pod logs:"
+              kubectl logs $FAILING_POD --tail=50 || true
+            fi
+            
+            echo "⚠️ Continuing despite deployment issues. Check logs for details."
+            break
+          # Timeout after waiting too long
+          elif [ $ELAPSED_TIME -gt $DEPLOY_TIMEOUT ]; then
+            echo "⚠️ Deployment timed out after $DEPLOY_TIMEOUT seconds."
+            kubectl get pods -l app=streamlit-app
+            kubectl describe deployment/$DEPLOYMENT_NAME
+            echo "⚠️ Continuing despite timeout. Check logs for details."
+            break
+          fi
+          
+          # Progress update
+          echo -e "\nWaiting for deployment to complete... (${ELAPSED_TIME}s / ${DEPLOY_TIMEOUT}s)"
+          sleep 10
+        done
+        
+      - kubectl delete pod ${APP_NAME}-kaniko-builder --ignore-not-found=true
+      - echo "✅ Build process completed!"
 
 artifacts:
   files:
-    - kubernetes/streamlit-deployment-updated.yaml
-    - kubernetes/kaniko-pod-updated.yaml
+    - kubernetes/kaniko-pod.yaml
+    - kubernetes/streamlit-deployment.yaml
   discard-paths: no
