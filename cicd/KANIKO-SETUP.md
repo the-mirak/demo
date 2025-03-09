@@ -1,29 +1,42 @@
-# Setting Up Kaniko with IRSA for Container Image Building
+# Kaniko Setup Guide for AWS EKS
 
-This guide explains how to set up Kaniko for building container images in your CI/CD pipeline using IAM Roles for Service Accounts (IRSA) for secure authentication with AWS services.
-
-## What is Kaniko?
-
-Kaniko is a tool to build container images from a Dockerfile, inside a container or Kubernetes cluster, without requiring a Docker daemon. This makes it ideal for building container images in environments where Docker is not available or where you want to avoid privileged containers.
+This guide explains how to set up Kaniko for building container images in your EKS cluster using IAM Roles for Service Accounts (IRSA).
 
 ## Prerequisites
 
-Before setting up Kaniko, ensure you have:
+Before setting up the CI/CD pipeline, you need to set up the Kaniko environment:
 
 1. An AWS account with appropriate permissions
-2. An Amazon EKS cluster
-3. AWS CLI installed and configured
+2. An existing Amazon EKS cluster
+3. AWS CLI installed and configured locally
 4. kubectl installed and configured to access your EKS cluster
 
-## Setup Steps
+## One-Time Setup Steps
 
-### 1. Set Up OIDC Provider for EKS
+Before running the CI/CD pipeline, you need to set up the Kaniko environment once. This includes creating the IAM role and service account.
 
-If you haven't already set up an OIDC provider for your EKS cluster, you'll need to do so:
+### Option 1: Using the Setup Script (Recommended)
+
+We've provided a convenient script to set up the Kaniko environment:
+
+```bash
+./scripts/init-kaniko-environment.sh -c <your-eks-cluster-name> -i
+```
+
+This script will:
+1. Set up the OIDC provider for your EKS cluster
+2. Create the IAM role with the necessary permissions
+3. Create the Kubernetes service account with IRSA
+
+### Option 2: Manual Setup
+
+If you prefer to set up the environment manually, follow these steps:
+
+#### 1. Set Up OIDC Provider for EKS
 
 ```bash
 # Get your EKS cluster's OIDC provider URL
-OIDC_PROVIDER=$(aws eks describe-cluster --name eks-workshop --query "cluster.identity.oidc.issuer" --output text | sed 's/https:\/\///')
+OIDC_PROVIDER=$(aws eks describe-cluster --name <your-eks-cluster-name> --query "cluster.identity.oidc.issuer" --output text | sed 's/https:\/\///')
 
 # Create the OIDC provider in IAM
 aws iam create-open-id-connect-provider \
@@ -32,9 +45,7 @@ aws iam create-open-id-connect-provider \
     --thumbprint-list $(echo | openssl s_client -servername $OIDC_PROVIDER -showcerts -connect $OIDC_PROVIDER:443 2>/dev/null | openssl x509 -in /dev/stdin -fingerprint -noout | sed 's/://g' | sed 's/SHA1 Fingerprint=//g')
 ```
 
-### 2. Create IAM Role for Kaniko
-
-Create the IAM role that Kaniko will assume:
+#### 2. Create IAM Role for Kaniko
 
 ```bash
 # Create a trust policy file
@@ -45,12 +56,12 @@ cat > trust-policy.json << EOF
     {
       "Effect": "Allow",
       "Principal": {
-        "Federated": "arn:aws:iam::YOUR_AWS_ACCOUNT_ID:oidc-provider/oidc.eks.YOUR_REGION.amazonaws.com/id/YOUR_OIDC_ID"
+        "Federated": "arn:aws:iam::<your-account-id>:oidc-provider/oidc.eks.<your-region>.amazonaws.com/id/<oidc-id>"
       },
       "Action": "sts:AssumeRoleWithWebIdentity",
       "Condition": {
         "StringEquals": {
-          "oidc.eks.YOUR_REGION.amazonaws.com/id/YOUR_OIDC_ID:sub": "system:serviceaccount:default:kaniko-builder"
+          "oidc.eks.<your-region>.amazonaws.com/id/<oidc-id>:sub": "system:serviceaccount:default:kaniko-builder"
         }
       }
     }
@@ -66,18 +77,7 @@ aws iam attach-role-policy --role-name kaniko-ecr-push-role --policy-arn arn:aws
 aws iam attach-role-policy --role-name kaniko-ecr-push-role --policy-arn arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
 ```
 
-### 3. Create ECR Repositories
-
-Create the ECR repositories for your application and the Kaniko cache:
-
-```bash
-aws ecr create-repository --repository-name streamlit-app
-aws ecr create-repository --repository-name kaniko-cache
-```
-
-### 4. Create Kubernetes Service Account with IRSA
-
-Create a Kubernetes service account annotated with the IAM role ARN:
+#### 3. Create Kubernetes Service Account
 
 ```bash
 cat > kaniko-service-account.yaml << EOF
@@ -87,7 +87,7 @@ metadata:
   name: kaniko-builder
   namespace: default
   annotations:
-    eks.amazonaws.com/role-arn: arn:aws:iam::YOUR_AWS_ACCOUNT_ID:role/kaniko-ecr-push-role
+    eks.amazonaws.com/role-arn: arn:aws:iam::<your-account-id>:role/kaniko-ecr-push-role
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -117,100 +117,49 @@ EOF
 kubectl apply -f kaniko-service-account.yaml
 ```
 
-### 5. Configure Kaniko Pod to Use IRSA
+## Testing the Setup
 
-Create a Kaniko pod configuration that uses the service account with IRSA:
+You can test the Kaniko setup using the provided script:
 
 ```bash
-cat > kaniko-pod.yaml << EOF
-apiVersion: v1
-kind: Pod
-metadata:
-  name: kaniko-builder
-  namespace: default
-spec:
-  serviceAccountName: kaniko-builder
-  restartPolicy: Never
-  containers:
-  - name: kaniko
-    image: gcr.io/kaniko-project/executor:latest
-    args:
-    - "--dockerfile=Dockerfile"
-    - "--context=s3://YOUR_S3_BUCKET/app.tar.gz"
-    - "--destination=YOUR_AWS_ACCOUNT_ID.dkr.ecr.YOUR_REGION.amazonaws.com/streamlit-app:latest"
-    - "--cache=true"
-    - "--cache-repo=YOUR_AWS_ACCOUNT_ID.dkr.ecr.YOUR_REGION.amazonaws.com/kaniko-cache"
-    - "--cleanup"
-    env:
-    - name: AWS_SDK_LOAD_CONFIG
-      value: "true"
-    - name: AWS_REGION
-      value: "YOUR_REGION"
-    volumeMounts:
-    - name: aws-iam-token
-      mountPath: /var/run/secrets/eks.amazonaws.com/serviceaccount
-      readOnly: true
-  volumes:
-  - name: aws-iam-token
-    projected:
-      sources:
-      - serviceAccountToken:
-          path: token
-          expirationSeconds: 86400
-EOF
-
-kubectl apply -f kaniko-pod.yaml
+./scripts/build-with-kaniko.sh -a streamlit-app -s <your-s3-bucket> -p app
 ```
 
-When using IRSA, the AWS SDK automatically detects and uses the credentials provided by the service account token. You only need to include the `AWS_SDK_LOAD_CONFIG` and `AWS_REGION` environment variables.
-
-## How It Works
-
-The CI/CD pipeline uses Kaniko with IRSA for secure authentication:
-
-1. The application code is compressed and uploaded to an S3 bucket
-2. A Kaniko pod is created in the EKS cluster with the kaniko-builder service account
-3. The service account uses IRSA to assume the IAM role
-4. Kaniko builds the container image and pushes it directly to ECR
-5. The Kubernetes deployment is updated with the new image
+This script will:
+1. Package your application and upload it to S3
+2. Create a Kaniko pod to build the container image
+3. Push the image to ECR
 
 ## Troubleshooting
 
-If you encounter issues with Kaniko:
+If you encounter issues with the Kaniko setup:
 
-1. Check the Kaniko pod logs:
-
+1. Check the IAM role trust policy:
    ```bash
-   kubectl logs -f streamlit-app-kaniko-builder
+   aws iam get-role --role-name kaniko-ecr-push-role --query 'Role.AssumeRolePolicyDocument'
    ```
 
-2. Verify the IAM role has the correct permissions:
-
-   ```bash
-   aws iam get-role --role-name kaniko-ecr-push-role
-   aws iam list-attached-role-policies --role-name kaniko-ecr-push-role
-   ```
-
-3. Check the service account annotation:
-
+2. Verify the service account annotation:
    ```bash
    kubectl get serviceaccount kaniko-builder -o yaml
    ```
 
-4. Ensure the OIDC provider is correctly set up:
-
+3. Check the pod logs:
    ```bash
-   aws iam list-open-id-connect-providers
+   kubectl logs streamlit-app-kaniko-builder
    ```
 
-5. Verify the pod is using the correct service account:
-
+4. Verify the pod status:
    ```bash
    kubectl describe pod streamlit-app-kaniko-builder
    ```
 
-6. Check if the ECR repositories exist:
+## CI/CD Pipeline Integration
 
-   ```bash
-   aws ecr describe-repositories --repository-names streamlit-app kaniko-cache
-   ```
+The CI/CD pipeline is configured to use the pre-existing Kaniko environment. It will:
+1. Create the necessary ECR repositories if they don't exist
+2. Apply the Kaniko service account configuration
+3. Create a Kaniko pod to build the container image
+4. Deploy the application to the EKS cluster
+
+No additional setup is required for the CI/CD pipeline once the Kaniko environment is set up.
