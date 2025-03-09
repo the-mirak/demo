@@ -10,134 +10,53 @@ ENABLE_CACHE="true"
 CLEANUP_AFTER_BUILD="true"
 USE_IRSA="true"
 
-# Display usage information
-function show_usage {
-  echo "Usage: $0 -a APP_NAME -s S3_BUCKET [-d DOCKERFILE_PATH] [-t IMAGE_TAG] [-c ENABLE_CACHE] [-p APP_PATH] [-i]"
-  echo ""
-  echo "Required arguments:"
-  echo "  -a APP_NAME    Name of the application (used for ECR repository name)"
-  echo "  -s S3_BUCKET   S3 bucket name for storing build context"
-  echo ""
-  echo "Optional arguments:"
-  echo "  -d DOCKERFILE_PATH  Path to Dockerfile (default: Dockerfile)"
-  echo "  -t IMAGE_TAG        Tag for the built image (default: latest)"
-  echo "  -c ENABLE_CACHE     Enable build caching (default: true)"
-  echo "  -p APP_PATH         Path to the application files (default: current directory)"
-  echo "  -i                  Use IRSA (IAM Roles for Service Accounts) instead of AWS credentials secret"
-  echo "  -n                  Do not cleanup temporary files after build"
-  echo "  -h                  Show this help message"
-  exit 1
-}
-
 # Parse command line arguments
 while getopts ":a:s:d:t:c:p:inh" opt; do
   case ${opt} in
-    a)
-      APP_NAME=$OPTARG
-      ;;
-    s)
-      S3_BUCKET=$OPTARG
-      ;;
-    d)
-      DOCKERFILE_PATH=$OPTARG
-      ;;
-    t)
-      IMAGE_TAG=$OPTARG
-      ;;
-    c)
-      ENABLE_CACHE=$OPTARG
-      ;;
-    p)
-      APP_PATH=$OPTARG
-      ;;
-    i)
-      USE_IRSA="true"
-      ;;
-    n)
-      CLEANUP_AFTER_BUILD="false"
-      ;;
-    h)
-      show_usage
-      ;;
-    \?)
-      echo "Invalid option: -$OPTARG" 1>&2
-      show_usage
-      ;;
-    :)
-      echo "Option -$OPTARG requires an argument." 1>&2
-      show_usage
-      ;;
+    a) APP_NAME=$OPTARG ;;
+    s) S3_BUCKET=$OPTARG ;;
+    d) DOCKERFILE_PATH=$OPTARG ;;
+    t) IMAGE_TAG=$OPTARG ;;
+    c) ENABLE_CACHE=$OPTARG ;;
+    p) APP_PATH=$OPTARG ;;
+    i) USE_IRSA="true" ;;
+    n) CLEANUP_AFTER_BUILD="false" ;;
+    h) show_usage ;;
+    \?) echo "Invalid option: -$OPTARG" 1>&2; show_usage ;;
+    :) echo "Option -$OPTARG requires an argument." 1>&2; show_usage ;;
   esac
 done
 
-# Check required arguments
+# Ensure required parameters
 if [ -z "$APP_NAME" ] || [ -z "$S3_BUCKET" ]; then
-  echo "Error: APP_NAME and S3_BUCKET are required arguments"
+  echo "❌ Error: APP_NAME and S3_BUCKET are required"
   show_usage
 fi
 
-# Set default APP_PATH if not provided
-if [ -z "$APP_PATH" ]; then
-  APP_PATH="."
-fi
+# Get AWS account details
+AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+AWS_REGION=$(aws configure get region)
 
-# Get AWS account ID and region
-export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-export AWS_REGION=$(aws configure get region)
+echo "=== Step 1: Ensuring ECR repositories exist ==="
 
-echo "=== Building $APP_NAME with Kaniko ==="
-echo "APP_NAME: $APP_NAME"
-echo "S3_BUCKET: $S3_BUCKET"
-echo "DOCKERFILE_PATH: $DOCKERFILE_PATH"
-echo "IMAGE_TAG: $IMAGE_TAG"
-echo "ENABLE_CACHE: $ENABLE_CACHE"
-echo "USE_IRSA: $USE_IRSA"
-echo "AWS_ACCOUNT_ID: $AWS_ACCOUNT_ID"
-echo "AWS_REGION: $AWS_REGION"
-echo ""
+# Ensure the main application repository exists
+aws ecr describe-repositories --repository-names "$APP_NAME" >/dev/null 2>&1 || \
+aws ecr create-repository --repository-name "$APP_NAME"
 
-# Create ECR repository if it doesn't exist - using a non-blocking approach
-echo "=== Step 1: Creating ECR repository (if it doesn't exist) ==="
-# Check if repository exists
-REPO_EXISTS=$(aws ecr describe-repositories --repository-names "$APP_NAME" --query "repositories[0].repositoryName" --output text 2>/dev/null || echo "false")
+# Ensure the per-app cache repository exists (`<APP_NAME>/cache`)
+CACHE_REPO="${APP_NAME}/cache"
+aws ecr describe-repositories --repository-names "$CACHE_REPO" >/dev/null 2>&1 || \
+aws ecr create-repository --repository-name "$CACHE_REPO"
 
-if [ "$REPO_EXISTS" == "false" ] || [ "$REPO_EXISTS" == "None" ]; then
-  echo "Creating ECR repository: $APP_NAME"
-  aws ecr create-repository --repository-name "$APP_NAME" --output text > /dev/null
-else
-  echo "ECR repository $APP_NAME already exists"
-fi
+echo "✅ ECR repositories are set up successfully!"
 
-# Create Kaniko cache repository if caching is enabled - using a non-blocking approach
-if [ "$ENABLE_CACHE" = "true" ]; then
-  echo "=== Step 2: Creating Kaniko cache repository (if it doesn't exist) ==="
-  # Check if cache repository exists
-  CACHE_REPO_EXISTS=$(aws ecr describe-repositories --repository-names kaniko-cache --query "repositories[0].repositoryName" --output text 2>/dev/null || echo "false")
-  
-  if [ "$CACHE_REPO_EXISTS" == "false" ] || [ "$CACHE_REPO_EXISTS" == "None" ]; then
-    echo "Creating ECR repository: kaniko-cache"
-    aws ecr create-repository --repository-name kaniko-cache --output text > /dev/null
-  else
-    echo "ECR repository kaniko-cache already exists"
-  fi
-fi
-
-# Package application and upload to S3
-echo "=== Step 3: Packaging application and uploading to S3 ==="
-# Create a temporary directory for packaging
-TMP_DIR=$(mktemp -d)
-cp -r "$APP_PATH"/* "$TMP_DIR"
-
-# Create a tar.gz archive
-cd "$TMP_DIR"
-tar -czf "/tmp/${APP_NAME}.tar.gz" .
-cd - > /dev/null
-
-# Upload to S3
+# Step 2: Upload Build Context to S3
+echo "=== Step 2: Uploading build context to S3 ==="
+tar -czf "/tmp/${APP_NAME}.tar.gz" -C "${APP_PATH}" .
 aws s3 cp "/tmp/${APP_NAME}.tar.gz" "s3://${S3_BUCKET}/${APP_NAME}.tar.gz"
 
-echo "=== Step 4: Creating Kaniko pod manifest ==="
-# Create Kaniko pod manifest
+# Step 3: Generate Kaniko Pod Manifest
+echo "=== Step 3: Creating Kaniko pod manifest ==="
 cat > "/tmp/${APP_NAME}-kaniko-pod.yaml" << EOF
 apiVersion: v1
 kind: Pod
@@ -155,63 +74,44 @@ spec:
     - "--context=s3://${S3_BUCKET}/${APP_NAME}.tar.gz"
     - "--destination=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${APP_NAME}:${IMAGE_TAG}"
     - "--cache=${ENABLE_CACHE}"
-    - "--cache-repo=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/kaniko-cache"
+    - "--cache-repo=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${CACHE_REPO}"
     - "--cleanup"
-    env:
-    - name: AWS_SDK_LOAD_CONFIG
-      value: "true"
 EOF
 
-# Add AWS credentials volume only if not using IRSA
-if [ "$USE_IRSA" != "true" ]; then
-  cat >> "/tmp/${APP_NAME}-kaniko-pod.yaml" << EOF
-    volumeMounts:
-    - name: aws-credentials
-      mountPath: /kaniko/.aws
-  volumes:
-  - name: aws-credentials
-    secret:
-      secretName: aws-credentials
-      items:
-      - key: credentials
-        path: credentials
-EOF
+# Step 4: Delete Existing Pod if It Exists
+echo "=== Step 4: Deleting any existing Kaniko pod ==="
+kubectl delete pod "${APP_NAME}-kaniko-builder" --namespace default --ignore-not-found | cat
+
+# Step 5: Run Kaniko Build
+echo "=== Step 5: Running Kaniko Build ==="
+kubectl apply -f "/tmp/${APP_NAME}-kaniko-pod.yaml"
+
+# Step 6: Wait for Pod Initialization
+echo "Waiting for Kaniko pod to start..."
+kubectl wait --for=condition=Initialized pod/${APP_NAME}-kaniko-builder --timeout=60s | cat || \
+{ echo "❌ Kaniko pod failed to initialize! Fetching events..."; kubectl describe pod/${APP_NAME}-kaniko-builder; exit 1; }
+
+# Step 7: Stream Logs in Real-Time
+echo "Build started. Streaming logs..."
+kubectl logs -f "${APP_NAME}-kaniko-builder"
+
+# Step 8: Check if Pod Already Completed
+POD_STATUS=$(kubectl get pod ${APP_NAME}-kaniko-builder -o jsonpath='{.status.phase}')
+if [ "$POD_STATUS" == "Succeeded" ]; then
+  echo "✅ Kaniko build completed successfully!"
+else
+  echo "Waiting for Kaniko pod to complete..."
+  kubectl wait --for=condition=complete pod/${APP_NAME}-kaniko-builder --timeout=600s || \
+  { echo "❌ Kaniko build failed! Fetching last 50 log lines..."; kubectl logs "${APP_NAME}-kaniko-builder" | tail -n 50; exit 1; }
 fi
 
-echo "=== Step 5: Running Kaniko build ==="
-# Apply the Kaniko pod manifest
-kubectl apply -f "/tmp/${APP_NAME}-kaniko-pod.yaml" | cat
+echo "✅ Image pushed successfully: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${APP_NAME}:${IMAGE_TAG}"
 
-# Wait for Kaniko pod to become initialized
-echo "Waiting for Kaniko build to initialize..."
-kubectl wait --for=condition=initialized "pod/${APP_NAME}-kaniko-builder" --timeout=60s | cat
-
-# Follow the Kaniko logs
-echo "Build started, following build logs..."
-# Use timeout to prevent hanging indefinitely
-timeout 600 kubectl logs -f "${APP_NAME}-kaniko-builder" || echo "Log streaming timed out after 10 minutes"
-
-# Wait for the pod to complete
-echo "Waiting for build to complete..."
-# Use timeout to prevent hanging indefinitely
-kubectl wait --for=condition=complete "pod/${APP_NAME}-kaniko-builder" --timeout=180s | cat || true
-
-# Check if build was successful
-POD_STATUS=$(kubectl get pod "${APP_NAME}-kaniko-builder" -o jsonpath='{.status.phase}' | cat)
-if [ "$POD_STATUS" != "Succeeded" ]; then
-  echo "Build failed with status: $POD_STATUS"
-  kubectl logs "${APP_NAME}-kaniko-builder" | tail -n 50 | cat
-  exit 1
-fi
-
-echo "=== Build completed successfully ==="
-echo "Image: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${APP_NAME}:${IMAGE_TAG}"
-
-# Cleanup
+# Step 9: Cleanup
 if [ "$CLEANUP_AFTER_BUILD" = "true" ]; then
-  echo "=== Cleaning up resources ==="
+  echo "=== Step 9: Cleaning up resources ==="
   kubectl delete pod "${APP_NAME}-kaniko-builder" --force --grace-period=0 | cat || true
-  rm -rf "$TMP_DIR" "/tmp/${APP_NAME}.tar.gz" "/tmp/${APP_NAME}-kaniko-pod.yaml"
+  rm -rf "/tmp/${APP_NAME}.tar.gz" "/tmp/${APP_NAME}-kaniko-pod.yaml"
 fi
 
 echo ""

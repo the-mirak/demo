@@ -9,133 +9,140 @@ phases:
       - curl -o kubectl https://amazon-eks.s3.us-west-2.amazonaws.com/1.23.7/2022-06-29/bin/linux/amd64/kubectl
       - chmod +x kubectl
       - mv kubectl /usr/local/bin/
-      - curl -o aws-iam-authenticator https://amazon-eks.s3.us-west-2.amazonaws.com/1.21.2/2021-07-05/bin/linux/amd64/aws-iam-authenticator
-      - chmod +x aws-iam-authenticator
-      - mv aws-iam-authenticator /usr/local/bin/
       - yum install -y jq gettext
-      - echo "Installing eksctl..."
-      - curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" | tar xz -C /tmp
-      - mv /tmp/eksctl /usr/local/bin
-      - eksctl version
 
   pre_build:
     commands:
       - echo "Setting up environment variables..."
       - REPOSITORY_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/streamlit-app
-      - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
-      - IMAGE_TAG=${COMMIT_HASH:=latest}
+      - IMAGE_TAG=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
       - APP_NAME=streamlit-app
-      - DOCKERFILE_PATH=Dockerfile
-      - ENABLE_CACHE=true
-      - echo "Checking CodeBuild role identity..."
-      - aws sts get-caller-identity
-      - echo "Updating kubeconfig..."
-      - aws eks update-kubeconfig --name $EKS_CLUSTER_NAME --region $AWS_REGION
-      - kubectl config view
-      - echo "Setting up EKS auth ConfigMap..."
-      - chmod +x cicd/scripts/setup-eks-auth.sh
-      - |
-        ./cicd/scripts/setup-eks-auth.sh --eks-cluster $EKS_CLUSTER_NAME --force || {
-          echo "Warning: EKS auth setup failed, but continuing with the build..."
-          echo "CodeBuild role will be used directly through IRSA, no need to update aws-auth ConfigMap"
-        }
-      - |
-        kubectl get svc || echo "Warning: Could not get services, but continuing with the build..."
-      - echo "Creating S3 bucket for context if it doesn't exist..."
       - S3_BUCKET=kaniko-context-$AWS_ACCOUNT_ID-$AWS_REGION
+      - IAM_ROLE_NAME="kaniko-ecr-push-role"
+      - IAM_POLICY_NAME="kaniko-ecr-policy"
+      - SERVICE_ACCOUNT="kaniko-builder"
+      - CLUSTER_NAME=$EKS_CLUSTER_NAME
+      - OIDC_PROVIDER_URL=$(aws eks describe-cluster --name "$CLUSTER_NAME" --query "cluster.identity.oidc.issuer" --output text)
+      - OIDC_PROVIDER_ARN="arn:aws:iam::$AWS_ACCOUNT_ID:oidc-provider/${OIDC_PROVIDER_URL#https://}"
+
+      - echo "Verifying IAM Role: $IAM_ROLE_NAME..."
+      - |
+        ROLE_EXISTS=$(aws iam get-role --role-name "$IAM_ROLE_NAME" --query "Role.RoleName" --output text 2>/dev/null || echo "None")
+        if [ "$ROLE_EXISTS" == "None" ]; then
+          echo "Creating IAM role: $IAM_ROLE_NAME"
+          cat > /tmp/kaniko-trust-policy.json << EOF
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Principal": { "Federated": "$OIDC_PROVIDER_ARN" },
+                "Action": "sts:AssumeRoleWithWebIdentity",
+                "Condition": {
+                  "StringEquals": { "${OIDC_PROVIDER_URL#https://}:sub": "system:serviceaccount:default:$SERVICE_ACCOUNT" }
+                }
+              }
+            ]
+          }
+          EOF
+          aws iam create-role --role-name "$IAM_ROLE_NAME" --assume-role-policy-document file:///tmp/kaniko-trust-policy.json
+          echo "✅ IAM Role created: $IAM_ROLE_NAME"
+        else
+          echo "✅ IAM Role already exists"
+        fi
+
+      - echo "Verifying IAM Policy: $IAM_POLICY_NAME..."
+      - |
+        POLICY_EXISTS=$(aws iam list-policies --scope Local --query "Policies[?PolicyName=='$IAM_POLICY_NAME'].Arn" --output text)
+        if [ -z "$POLICY_EXISTS" ] || [ "$POLICY_EXISTS" == "None" ]; then
+          echo "Creating IAM policy: $IAM_POLICY_NAME"
+          cat > /tmp/kaniko-ecr-policy.json << EOF
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "ecr:GetAuthorizationToken",
+                  "ecr:BatchCheckLayerAvailability",
+                  "ecr:BatchGetImage",
+                  "ecr:CompleteLayerUpload",
+                  "ecr:GetDownloadUrlForLayer",
+                  "ecr:InitiateLayerUpload",
+                  "ecr:PutImage",
+                  "ecr:UploadLayerPart"
+                ],
+                "Resource": "*"
+              }
+            ]
+          }
+          EOF
+          aws iam create-policy --policy-name "$IAM_POLICY_NAME" --policy-document file:///tmp/kaniko-ecr-policy.json
+          echo "✅ IAM Policy created: $IAM_POLICY_NAME"
+        else
+          echo "✅ IAM Policy already exists"
+        fi
+
+      - echo "Attaching IAM policy to role..."
+      - aws iam attach-role-policy --role-name "$IAM_ROLE_NAME" --policy-arn "arn:aws:iam::$AWS_ACCOUNT_ID:policy/$IAM_POLICY_NAME"
+
+      - echo "Verifying Kubernetes service account: $SERVICE_ACCOUNT..."
+      - |
+        kubectl annotate serviceaccount $SERVICE_ACCOUNT \
+          -n default \
+          eks.amazonaws.com/role-arn="arn:aws:iam::$AWS_ACCOUNT_ID:role/$IAM_ROLE_NAME" --overwrite || true
+      - echo "✅ IRSA annotation applied: $IAM_ROLE_NAME"
+
+      - echo "Creating S3 bucket for context if it doesn't exist..."
       - aws s3api create-bucket --bucket $S3_BUCKET --region $AWS_REGION --create-bucket-configuration LocationConstraint=$AWS_REGION || true
       - echo "Preparing application context..."
       - tar -czf /tmp/$APP_NAME.tar.gz -C app .
       - aws s3 cp /tmp/$APP_NAME.tar.gz s3://$S3_BUCKET/
-      - echo "Running pre-deployment script..."
-      - chmod +x cicd/scripts/pre_deploy.sh
-      - ./cicd/scripts/pre_deploy.sh
 
   build:
     commands:
-      - echo "Build started on $(date)"
       - echo "Building the container image using Kaniko..."
-      - echo "Checking if ECR repositories exist..."
-      - |
-        # Check if streamlit-app repository exists
-        APP_REPO_EXISTS=$(aws ecr describe-repositories --repository-names $APP_NAME 2>/dev/null || echo "false")
-        if [ "$APP_REPO_EXISTS" = "false" ]; then
-          echo "Creating $APP_NAME ECR repository..."
-          aws ecr create-repository --repository-name $APP_NAME
-        else
-          echo "$APP_NAME ECR repository already exists"
-        fi
-        
-        # Check if kaniko-cache repository exists
-        CACHE_REPO_EXISTS=$(aws ecr describe-repositories --repository-names kaniko-cache 2>/dev/null || echo "false")
-        if [ "$CACHE_REPO_EXISTS" = "false" ]; then
-          echo "Creating kaniko-cache ECR repository..."
-          aws ecr create-repository --repository-name kaniko-cache
-        else
-          echo "kaniko-cache ECR repository already exists"
-        fi
-      - echo "Applying Kaniko service account..."
-      - envsubst < kubernetes/kaniko-service-account.yaml > kubernetes/kaniko-service-account-updated.yaml
-      - kubectl apply -f kubernetes/kaniko-service-account-updated.yaml
-      - echo "Verifying service account configuration..."
-      - kubectl get serviceaccount kaniko-builder -o yaml
-      - echo "Creating Kaniko pod..."
       - kubectl delete pod ${APP_NAME}-kaniko-builder --ignore-not-found=true
       - envsubst < kubernetes/kaniko-pod.yaml > kubernetes/kaniko-pod-updated.yaml
       - kubectl apply -f kubernetes/kaniko-pod-updated.yaml
-      - echo "Verifying pod configuration..."
-      - kubectl get pod ${APP_NAME}-kaniko-builder -o yaml
-      - echo "Waiting for Kaniko pod to complete..."
-      - kubectl wait --for=condition=Ready pod/${APP_NAME}-kaniko-builder --timeout=60s || true
+      - echo "Streaming Kaniko logs..."
       - kubectl logs -f ${APP_NAME}-kaniko-builder || true
       - echo "Waiting for Kaniko build to complete..."
       - |
-        # Wait for the pod to complete with a timeout
-        TIMEOUT=300
+        TIMEOUT=600
         START_TIME=$(date +%s)
         while true; do
           POD_STATUS=$(kubectl get pod ${APP_NAME}-kaniko-builder -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
           CURRENT_TIME=$(date +%s)
           ELAPSED_TIME=$((CURRENT_TIME - START_TIME))
           
-          if [ "$POD_STATUS" = "Succeeded" ]; then
-            echo "Build succeeded!"
+          if [ "$POD_STATUS" == "Succeeded" ]; then
+            echo "✅ Build succeeded!"
             break
-          elif [ "$POD_STATUS" = "Failed" ]; then
-            echo "Build failed! Checking logs..."
+          elif [ "$POD_STATUS" == "Failed" ]; then
+            echo "❌ Build failed! Fetching logs..."
             kubectl logs ${APP_NAME}-kaniko-builder
             kubectl describe pod ${APP_NAME}-kaniko-builder
             exit 1
           elif [ $ELAPSED_TIME -gt $TIMEOUT ]; then
-            echo "Build timed out after $TIMEOUT seconds!"
+            echo "❌ Build timed out after $TIMEOUT seconds!"
             kubectl logs ${APP_NAME}-kaniko-builder
             kubectl describe pod ${APP_NAME}-kaniko-builder
             exit 1
           fi
-          
-          echo "Waiting for build to complete... Current status: $POD_STATUS, elapsed time: $ELAPSED_TIME seconds"
           sleep 5
         done
 
   post_build:
     commands:
-      - echo "Build completed on $(date)"
-      - echo "Update Kubernetes deployment..."
-      - envsubst < kubernetes/streamlit-deployment.yaml > kubernetes/streamlit-deployment-updated.yaml
-      - kubectl apply -f kubernetes/streamlit-deployment-updated.yaml
-      - echo "Waiting for deployment to stabilize..."
+      - echo "Deploying to EKS..."
+      - kubectl apply -f kubernetes/streamlit-deployment.yaml
       - kubectl rollout status deployment/streamlit-app --timeout=300s
-      - echo "Cleaning up Kaniko pod..."
       - kubectl delete pod ${APP_NAME}-kaniko-builder
-      - echo "Deployment completed successfully!"
-      - echo "Running post-deployment verification..."
-      - chmod +x cicd/scripts/post_deploy.sh
-      - ./cicd/scripts/post_deploy.sh
+      - echo "✅ Deployment completed successfully!"
 
 artifacts:
   files:
     - kubernetes/streamlit-deployment-updated.yaml
     - kubernetes/kaniko-pod-updated.yaml
-    - appspec.yml
-    - cicd/scripts/post_deploy.sh
   discard-paths: no
