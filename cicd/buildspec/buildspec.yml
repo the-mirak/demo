@@ -65,6 +65,19 @@ phases:
       - echo "Checking if kaniko-ecr-push-role exists..."
       - ROLE_EXISTS=$(aws iam get-role --role-name kaniko-ecr-push-role 2>/dev/null || echo "false")
       - |
+        if [ "$ROLE_EXISTS" != "false" ]; then
+          echo "Deleting existing kaniko-ecr-push-role to update trust policy..."
+          # Detach policies first
+          aws iam detach-role-policy --role-name kaniko-ecr-push-role --policy-arn arn:aws:iam::aws:policy/AmazonECR-FullAccess || true
+          aws iam detach-role-policy --role-name kaniko-ecr-push-role --policy-arn arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess || true
+          # Delete role
+          aws iam delete-role --role-name kaniko-ecr-push-role || true
+          # Set ROLE_EXISTS to false to recreate it
+          ROLE_EXISTS="false"
+          echo "Waiting for role deletion to propagate..."
+          sleep 10
+        fi
+        
         if [ "$ROLE_EXISTS" = "false" ]; then
           echo "Creating kaniko-ecr-push-role for IRSA..."
           # Get OIDC provider ID
@@ -93,6 +106,7 @@ phases:
               "Action": "sts:AssumeRoleWithWebIdentity",
               "Condition": {
                 "StringEquals": {
+                  "oidc.eks.$AWS_REGION.amazonaws.com/id/$OIDC_PROVIDER_ID:aud": "sts.amazonaws.com",
                   "oidc.eks.$AWS_REGION.amazonaws.com/id/$OIDC_PROVIDER_ID:sub": "system:serviceaccount:default:kaniko-builder"
                 }
               }
@@ -134,9 +148,14 @@ phases:
       - echo "Applying Kaniko service account..."
       - envsubst < kubernetes/kaniko-service-account.yaml > kubernetes/kaniko-service-account-updated.yaml
       - kubectl apply -f kubernetes/kaniko-service-account-updated.yaml
+      - echo "Verifying service account configuration..."
+      - kubectl get serviceaccount kaniko-builder -o yaml
       - echo "Creating Kaniko pod..."
+      - kubectl delete pod ${APP_NAME}-kaniko-builder --ignore-not-found=true
       - envsubst < kubernetes/kaniko-pod.yaml > kubernetes/kaniko-pod-updated.yaml
       - kubectl apply -f kubernetes/kaniko-pod-updated.yaml
+      - echo "Verifying pod configuration..."
+      - kubectl get pod ${APP_NAME}-kaniko-builder -o yaml
       - echo "Waiting for Kaniko pod to complete..."
       - kubectl wait --for=condition=Ready pod/${APP_NAME}-kaniko-builder --timeout=60s || true
       - kubectl logs -f ${APP_NAME}-kaniko-builder
