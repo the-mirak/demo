@@ -1,6 +1,6 @@
-# Setting Up Kaniko for Container Image Building
+# Setting Up Kaniko with IRSA for Container Image Building
 
-This guide explains how to set up Kaniko for building container images in your CI/CD pipeline without using Docker.
+This guide explains how to set up Kaniko for building container images in your CI/CD pipeline using IAM Roles for Service Accounts (IRSA) for secure authentication with AWS services.
 
 ## What is Kaniko?
 
@@ -34,12 +34,36 @@ aws iam create-open-id-connect-provider \
 
 ### 2. Create IAM Role for Kaniko
 
-Run the provided setup script to create the necessary IAM role and policies:
+Create the IAM role that Kaniko will assume:
 
 ```bash
-# Update the OIDC_PROVIDER_ID in the script first
-# You can get it from the OIDC provider URL (the part after /id/)
-./cicd/scripts/setup-kaniko-iam.sh
+# Create a trust policy file
+cat > trust-policy.json << EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::YOUR_AWS_ACCOUNT_ID:oidc-provider/oidc.eks.YOUR_REGION.amazonaws.com/id/YOUR_OIDC_ID"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "oidc.eks.YOUR_REGION.amazonaws.com/id/YOUR_OIDC_ID:sub": "system:serviceaccount:default:kaniko-builder"
+        }
+      }
+    }
+  ]
+}
+EOF
+
+# Create the IAM role
+aws iam create-role --role-name kaniko-ecr-push-role --assume-role-policy-document file://trust-policy.json
+
+# Attach policies for ECR and S3 access
+aws iam attach-role-policy --role-name kaniko-ecr-push-role --policy-arn arn:aws:iam::aws:policy/AmazonECR-FullAccess
+aws iam attach-role-policy --role-name kaniko-ecr-push-role --policy-arn arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
 ```
 
 ### 3. Create ECR Repositories
@@ -51,11 +75,12 @@ aws ecr create-repository --repository-name streamlit-app
 aws ecr create-repository --repository-name kaniko-cache
 ```
 
-### 4. Update Service Account Annotation
+### 4. Create Kubernetes Service Account with IRSA
 
-Make sure the Kaniko service account in `kubernetes/kaniko-service-account.yaml` has the correct IAM role ARN:
+Create a Kubernetes service account annotated with the IAM role ARN:
 
-```yaml
+```bash
+cat > kaniko-service-account.yaml << EOF
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -63,36 +88,91 @@ metadata:
   namespace: default
   annotations:
     eks.amazonaws.com/role-arn: arn:aws:iam::YOUR_AWS_ACCOUNT_ID:role/kaniko-ecr-push-role
-```
-
-### 5. Create AWS Credentials Secret (Alternative to IRSA)
-
-If you're not using IAM Roles for Service Accounts (IRSA), you can create a Kubernetes secret with AWS credentials:
-
-```bash
-# Create AWS credentials file
-cat > /tmp/credentials << EOF
-[default]
-aws_access_key_id=YOUR_ACCESS_KEY
-aws_secret_access_key=YOUR_SECRET_KEY
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kaniko-builder-role
+  namespace: default
+rules:
+- apiGroups: [""]
+  resources: ["pods", "pods/log"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kaniko-builder-binding
+  namespace: default
+subjects:
+- kind: ServiceAccount
+  name: kaniko-builder
+  namespace: default
+roleRef:
+  kind: Role
+  name: kaniko-builder-role
+  apiGroup: rbac.authorization.k8s.io
 EOF
 
-# Create Kubernetes secret
-kubectl create secret generic aws-credentials \
-    --from-file=credentials=/tmp/credentials
-
-# Clean up
-rm /tmp/credentials
+kubectl apply -f kaniko-service-account.yaml
 ```
+
+### 5. Configure Kaniko Pod to Use IRSA
+
+Create a Kaniko pod configuration that uses the service account with IRSA:
+
+```bash
+cat > kaniko-pod.yaml << EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kaniko-builder
+  namespace: default
+spec:
+  serviceAccountName: kaniko-builder
+  restartPolicy: Never
+  containers:
+  - name: kaniko
+    image: gcr.io/kaniko-project/executor:latest
+    args:
+    - "--dockerfile=Dockerfile"
+    - "--context=s3://YOUR_S3_BUCKET/app.tar.gz"
+    - "--destination=YOUR_AWS_ACCOUNT_ID.dkr.ecr.YOUR_REGION.amazonaws.com/streamlit-app:latest"
+    - "--cache=true"
+    - "--cache-repo=YOUR_AWS_ACCOUNT_ID.dkr.ecr.YOUR_REGION.amazonaws.com/kaniko-cache"
+    - "--cleanup"
+    env:
+    - name: AWS_SDK_LOAD_CONFIG
+      value: "true"
+    - name: AWS_REGION
+      value: "YOUR_REGION"
+    volumeMounts:
+    - name: aws-iam-token
+      mountPath: /var/run/secrets/eks.amazonaws.com/serviceaccount
+      readOnly: true
+  volumes:
+  - name: aws-iam-token
+    projected:
+      sources:
+      - serviceAccountToken:
+          path: token
+          expirationSeconds: 86400
+EOF
+
+kubectl apply -f kaniko-pod.yaml
+```
+
+When using IRSA, the AWS SDK automatically detects and uses the credentials provided by the service account token. You only need to include the `AWS_SDK_LOAD_CONFIG` and `AWS_REGION` environment variables.
 
 ## How It Works
 
-The CI/CD pipeline now uses Kaniko instead of Docker:
+The CI/CD pipeline uses Kaniko with IRSA for secure authentication:
 
 1. The application code is compressed and uploaded to an S3 bucket
-2. A Kaniko pod is created in the EKS cluster
-3. Kaniko builds the container image and pushes it directly to ECR
-4. The Kubernetes deployment is updated with the new image
+2. A Kaniko pod is created in the EKS cluster with the kaniko-builder service account
+3. The service account uses IRSA to assume the IAM role
+4. Kaniko builds the container image and pushes it directly to ECR
+5. The Kubernetes deployment is updated with the new image
 
 ## Troubleshooting
 
@@ -111,13 +191,25 @@ If you encounter issues with Kaniko:
    aws iam list-attached-role-policies --role-name kaniko-ecr-push-role
    ```
 
-3. Ensure the S3 bucket exists and is accessible:
+3. Check the service account annotation:
 
    ```bash
-   aws s3 ls s3://kaniko-context-YOUR_AWS_ACCOUNT_ID-YOUR_AWS_REGION
+   kubectl get serviceaccount kaniko-builder -o yaml
    ```
 
-4. Check if the ECR repositories exist:
+4. Ensure the OIDC provider is correctly set up:
+
+   ```bash
+   aws iam list-open-id-connect-providers
+   ```
+
+5. Verify the pod is using the correct service account:
+
+   ```bash
+   kubectl describe pod streamlit-app-kaniko-builder
+   ```
+
+6. Check if the ECR repositories exist:
 
    ```bash
    aws ecr describe-repositories --repository-names streamlit-app kaniko-cache

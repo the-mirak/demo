@@ -5,7 +5,7 @@ phases:
     runtime-versions:
       python: 3.9
     commands:
-      - echo Installing dependencies...
+      - echo "Installing dependencies..."
       - curl -o kubectl https://amazon-eks.s3.us-west-2.amazonaws.com/1.23.7/2022-06-29/bin/linux/amd64/kubectl
       - chmod +x kubectl
       - mv kubectl /usr/local/bin/
@@ -24,7 +24,12 @@ phases:
       - DOCKERFILE_PATH=Dockerfile
       - ENABLE_CACHE=true
       - echo "Updating kubeconfig..."
-      - aws eks update-kubeconfig --name $EKS_CLUSTER_NAME --region $AWS_REGION --output text
+      - aws eks update-kubeconfig --name $EKS_CLUSTER_NAME --region $AWS_REGION
+      - kubectl config view
+      - echo "Setting up EKS auth ConfigMap..."
+      - chmod +x cicd/scripts/setup-eks-auth.sh
+      - ./cicd/scripts/setup-eks-auth.sh --eks-cluster $EKS_CLUSTER_NAME --force
+      - kubectl get svc
       - echo "Creating S3 bucket for context if it doesn't exist..."
       - S3_BUCKET=kaniko-context-$AWS_ACCOUNT_ID-$AWS_REGION
       - aws s3api create-bucket --bucket $S3_BUCKET --region $AWS_REGION --create-bucket-configuration LocationConstraint=$AWS_REGION || true
@@ -39,6 +44,75 @@ phases:
     commands:
       - echo "Build started on $(date)"
       - echo "Building the container image using Kaniko..."
+      - echo "Checking if kaniko-ecr-push-role exists..."
+      - ROLE_EXISTS=$(aws iam get-role --role-name kaniko-ecr-push-role 2>/dev/null || echo "false")
+      - |
+        if [ "$ROLE_EXISTS" = "false" ]; then
+          echo "Creating kaniko-ecr-push-role for IRSA..."
+          # Get OIDC provider ID
+          OIDC_PROVIDER_ID=$(aws eks describe-cluster --name $EKS_CLUSTER_NAME --query "cluster.identity.oidc.issuer" --output text | cut -d'/' -f5)
+          
+          # Check if OIDC provider exists
+          OIDC_PROVIDER_EXISTS=$(aws iam list-open-id-connect-providers | grep $OIDC_PROVIDER_ID || echo "false")
+          
+          if [ "$OIDC_PROVIDER_EXISTS" = "false" ]; then
+            echo "OIDC provider does not exist. Creating it..."
+            eksctl utils associate-iam-oidc-provider --cluster $EKS_CLUSTER_NAME --approve
+          else
+            echo "OIDC provider already exists"
+          fi
+          
+          # Create trust policy
+          cat > /tmp/trust-policy.json << EOF
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Federated": "arn:aws:iam::$AWS_ACCOUNT_ID:oidc-provider/oidc.eks.$AWS_REGION.amazonaws.com/id/$OIDC_PROVIDER_ID"
+              },
+              "Action": "sts:AssumeRoleWithWebIdentity",
+              "Condition": {
+                "StringEquals": {
+                  "oidc.eks.$AWS_REGION.amazonaws.com/id/$OIDC_PROVIDER_ID:sub": "system:serviceaccount:default:kaniko-builder"
+                }
+              }
+            }
+          ]
+        }
+        EOF
+          
+          # Create role
+          aws iam create-role --role-name kaniko-ecr-push-role --assume-role-policy-document file:///tmp/trust-policy.json
+          
+          # Attach policies
+          aws iam attach-role-policy --role-name kaniko-ecr-push-role --policy-arn arn:aws:iam::aws:policy/AmazonECR-FullAccess
+          aws iam attach-role-policy --role-name kaniko-ecr-push-role --policy-arn arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+          
+          echo "kaniko-ecr-push-role created successfully"
+        else
+          echo "kaniko-ecr-push-role already exists"
+        fi
+      - echo "Checking if ECR repositories exist..."
+      - |
+        # Check if streamlit-app repository exists
+        APP_REPO_EXISTS=$(aws ecr describe-repositories --repository-names $APP_NAME 2>/dev/null || echo "false")
+        if [ "$APP_REPO_EXISTS" = "false" ]; then
+          echo "Creating $APP_NAME ECR repository..."
+          aws ecr create-repository --repository-name $APP_NAME
+        else
+          echo "$APP_NAME ECR repository already exists"
+        fi
+        
+        # Check if kaniko-cache repository exists
+        CACHE_REPO_EXISTS=$(aws ecr describe-repositories --repository-names kaniko-cache 2>/dev/null || echo "false")
+        if [ "$CACHE_REPO_EXISTS" = "false" ]; then
+          echo "Creating kaniko-cache ECR repository..."
+          aws ecr create-repository --repository-name kaniko-cache
+        else
+          echo "kaniko-cache ECR repository already exists"
+        fi
       - echo "Applying Kaniko service account..."
       - envsubst < kubernetes/kaniko-service-account.yaml > kubernetes/kaniko-service-account-updated.yaml
       - kubectl apply -f kubernetes/kaniko-service-account-updated.yaml
@@ -72,7 +146,4 @@ artifacts:
     - kubernetes/kaniko-pod-updated.yaml
     - appspec.yml
     - cicd/scripts/post_deploy.sh
-  discard-paths: no 
-
-
-  
+  discard-paths: no

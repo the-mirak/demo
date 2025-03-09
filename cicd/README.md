@@ -112,13 +112,49 @@ chmod +x cicd/scripts/deploy_pipeline.sh
 
 Ensure that CodeBuild has the necessary permissions to deploy to your EKS cluster:
 
-1. Get the ARN of the CodeBuild service role:
+#### Option 1: Using the Setup Script (Recommended)
 
+We've provided a convenient script to set up the EKS auth ConfigMap:
+
+```bash
+./cicd/scripts/setup-eks-auth.sh --eks-cluster <your-eks-cluster-name>
+```
+
+This script will:
+1. Find the CodeBuild role ARN automatically
+2. Update the EKS auth ConfigMap to grant the role access
+3. Verify the configuration
+
+Run `./cicd/scripts/setup-eks-auth.sh --help` for more options.
+
+If you encounter authentication issues even after running the script, you can use the `--force` option to completely rebuild the aws-auth ConfigMap with proper formatting:
+
+```bash
+./cicd/scripts/setup-eks-auth.sh --eks-cluster <your-eks-cluster-name> --force
+```
+
+#### Option 2: Manual Setup
+
+1. Get the ARN of the CodeBuild service role using one of these methods:
+
+   **Method A: Using CloudFormation outputs** (if you've deployed with the updated template):
    ```bash
    aws cloudformation describe-stacks --stack-name streamlit-app-pipeline \
      --query "Stacks[0].Outputs[?OutputKey=='CodeBuildServiceRoleArn'].OutputValue" \
      --output text
    ```
+
+   **Method B: Using AWS CLI to find the role directly**:
+   ```bash
+   aws iam list-roles --query "Roles[?RoleName.contains(@, 'streamlit-app-pipeline') && RoleName.contains(@, 'CodeBuildServiceRole')].Arn" --output text
+   ```
+
+   **Method C: Using the AWS Management Console**:
+   - Go to the CloudFormation console
+   - Select your stack
+   - Go to the Resources tab
+   - Find the CodeBuildServiceRole resource and click on its Physical ID
+   - Copy the Role ARN from the IAM console
 
 2. Add the role to your EKS cluster's auth config:
 
@@ -133,6 +169,27 @@ Ensure that CodeBuild has the necessary permissions to deploy to your EKS cluste
      username: codebuild
      groups:
        - system:masters
+   ```
+
+   If the `mapRoles` section doesn't exist, create it:
+   ```yaml
+   apiVersion: v1
+   kind: ConfigMap
+   metadata:
+     name: aws-auth
+     namespace: kube-system
+   data:
+     mapRoles: |
+       - rolearn: <CodeBuild-Service-Role-ARN>
+         username: codebuild
+         groups:
+           - system:masters
+     # Keep any existing mapUsers or mapAccounts sections
+   ```
+
+4. Verify the configuration:
+   ```bash
+   kubectl describe configmap aws-auth -n kube-system
    ```
 
 ### 5. Trigger the Pipeline
@@ -314,5 +371,78 @@ The buildspec has been updated to:
 3. Ensure proper escaping of special characters
 
 If you encounter similar syntax errors, check your buildspec.yml for these common issues.
+
+### EKS Authentication Issues
+
+If you encounter an error like:
+```
+error: You must be logged in to the server (the server has asked for the client to provide credentials)
+```
+
+This indicates that CodeBuild cannot authenticate with your EKS cluster. This can be caused by:
+
+1. **Missing IAM Permissions**: The CodeBuild role doesn't have the necessary permissions to access EKS
+2. **Kubeconfig Issues**: The kubeconfig file wasn't properly generated or is missing authentication information
+3. **EKS Auth ConfigMap**: The CodeBuild role isn't properly mapped in the EKS auth ConfigMap
+
+The solution includes:
+
+1. **Enhanced IAM Permissions**: Added `eks:AccessKubernetesApi` and other necessary permissions to the CodeBuild role
+2. **Improved Kubeconfig Setup**: Updated the kubeconfig generation command and added verification steps
+3. **EKS Auth ConfigMap Setup**: Ensured the CodeBuild role is properly mapped in the EKS auth ConfigMap
+
+Make sure you've completed step 4 in the setup guide to add the CodeBuild role to your EKS cluster's auth ConfigMap.
+
+For additional help, please open an issue in the GitHub repository.
+
+### Kaniko Pod Issues
+
+If you encounter an error like:
+```
+Error from server (BadRequest): container "kaniko" in pod "streamlit-app-kaniko-builder" is waiting to start: ContainerCreating
+```
+
+This indicates that the Kaniko pod is having trouble starting. Common causes include:
+
+1. **Missing Secret**: The pod might be trying to mount a Secret that doesn't exist
+2. **IAM Role Issues**: The IAM role for the service account might not exist or have incorrect permissions
+3. **OIDC Provider Issues**: The OIDC provider for your EKS cluster might not be set up correctly
+
+The solution includes:
+
+1. **Using IRSA Properly**: Ensure the Kaniko pod is configured to use IAM Roles for Service Accounts (IRSA) correctly
+2. **Automatic Role Creation**: The pipeline now automatically creates the necessary IAM role if it doesn't exist
+3. **Proper Volume Mounts**: The pod should have the correct volume mounts for the service account token
+
+To fix issues with Kaniko and IRSA:
+
+1. **Check the service account annotation**:
+   ```bash
+   kubectl get serviceaccount kaniko-builder -o yaml
+   ```
+   Ensure it has the annotation `eks.amazonaws.com/role-arn` with the correct IAM role ARN.
+
+2. **Verify the OIDC provider**:
+   ```bash
+   aws iam list-open-id-connect-providers
+   ```
+   Make sure an OIDC provider exists for your EKS cluster.
+
+3. **Check the IAM role trust relationship**:
+   ```bash
+   aws iam get-role --role-name kaniko-ecr-push-role --query "Role.AssumeRolePolicyDocument" --output text
+   ```
+   Ensure it allows the service account to assume the role.
+
+4. **Verify the pod configuration**:
+   ```bash
+   kubectl get pod streamlit-app-kaniko-builder -o yaml
+   ```
+   Check that it's using the correct service account and has the necessary environment variables and volume mounts for IRSA.
+
+If you're still having issues, you can check the pod events for more details:
+```bash
+kubectl describe pod streamlit-app-kaniko-builder
+```
 
 For additional help, please open an issue in the GitHub repository. 

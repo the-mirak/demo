@@ -197,6 +197,13 @@ Resources:
                   - 'eks:ListClusters'
                   - 'eks:UpdateClusterConfig'
                   - 'eks:DescribeUpdate'
+                  - 'eks:AccessKubernetesApi'
+                  - 'eks:ListNodegroups'
+                  - 'eks:DescribeNodegroup'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'sts:AssumeRole'
                 Resource: '*'
               - Effect: Allow
                 Action:
@@ -429,4 +436,8 @@ Outputs:
   
   ECRRepositoryURL:
     Description: URL of the ECR Repository
-    Value: !GetAtt ECRRepository.RepositoryUri 
+    Value: !GetAtt ECRRepository.RepositoryUri
+    
+  CodeBuildServiceRoleArn:
+    Description: ARN of the CodeBuild service role
+    Value: !GetAtt CodeBuildServiceRole.Arn 

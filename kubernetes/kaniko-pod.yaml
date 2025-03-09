@@ -19,14 +19,23 @@ spec:
     env:
     - name: AWS_SDK_LOAD_CONFIG
       value: "true"
-    # When using AWS credentials (not IRSA), include volume mounts
+    - name: AWS_REGION
+      value: "${AWS_REGION}"
+    resources:
+      limits:
+        cpu: "1"
+        memory: "2Gi"
+      requests:
+        cpu: "500m"
+        memory: "1Gi"
     volumeMounts:
-    - name: aws-credentials
-      mountPath: /kaniko/.aws
+    - name: aws-iam-token
+      mountPath: /var/run/secrets/eks.amazonaws.com/serviceaccount
+      readOnly: true
   volumes:
-  - name: aws-credentials
-    secret:
-      secretName: aws-credentials
-      items:
-      - key: credentials
-        path: credentials
+  - name: aws-iam-token
+    projected:
+      sources:
+      - serviceAccountToken:
+          path: token
+          expirationSeconds: 86400
