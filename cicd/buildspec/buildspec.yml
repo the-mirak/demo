@@ -27,6 +27,8 @@ phases:
       - APP_NAME=streamlit-app
       - DOCKERFILE_PATH=Dockerfile
       - ENABLE_CACHE=true
+      - echo "Checking CodeBuild role permissions..."
+      - aws sts get-caller-identity
       - echo "Updating kubeconfig..."
       - aws eks update-kubeconfig --name $EKS_CLUSTER_NAME --region $AWS_REGION
       - kubectl config view
@@ -35,16 +37,7 @@ phases:
       - |
         ./cicd/scripts/setup-eks-auth.sh --eks-cluster $EKS_CLUSTER_NAME --force || {
           echo "Warning: EKS auth setup failed, but continuing with the build..."
-          echo "Attempting to manually update aws-auth ConfigMap..."
-          ROLE_ARN=$(aws iam list-roles --query "Roles[?RoleName.contains(@, 'streamlit-app-pipeline') && RoleName.contains(@, 'CodeBuildServiceRole')].Arn" --output text)
-          kubectl get configmap aws-auth -n kube-system -o yaml > /tmp/aws-auth.yaml
-          if ! grep -q "$ROLE_ARN" /tmp/aws-auth.yaml; then
-            echo "Adding CodeBuild role to aws-auth ConfigMap..."
-            EXISTING_ROLES=$(kubectl get configmap aws-auth -n kube-system -o jsonpath='{.data.mapRoles}')
-            NEW_ROLE="- rolearn: $ROLE_ARN\n  username: codebuild\n  groups:\n  - system:masters"
-            UPDATED_ROLES="$EXISTING_ROLES\n$NEW_ROLE"
-            kubectl patch configmap aws-auth -n kube-system --type merge -p "{\"data\":{\"mapRoles\":\"$UPDATED_ROLES\"}}"
-          fi
+          echo "CodeBuild role will be used directly through IRSA, no need to update aws-auth ConfigMap"
         }
       - |
         kubectl get svc || echo "Warning: Could not get services, but continuing with the build..."
@@ -62,39 +55,25 @@ phases:
     commands:
       - echo "Build started on $(date)"
       - echo "Building the container image using Kaniko..."
-      - echo "Checking if kaniko-ecr-push-role exists..."
-      - ROLE_EXISTS=$(aws iam get-role --role-name kaniko-ecr-push-role 2>/dev/null || echo "false")
+      - echo "Setting up IRSA for Kaniko..."
       - |
-        if [ "$ROLE_EXISTS" != "false" ]; then
-          echo "Deleting existing kaniko-ecr-push-role to update trust policy..."
-          # Detach policies first
-          aws iam detach-role-policy --role-name kaniko-ecr-push-role --policy-arn arn:aws:iam::aws:policy/AmazonECR-FullAccess || true
-          aws iam detach-role-policy --role-name kaniko-ecr-push-role --policy-arn arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess || true
-          # Delete role
-          aws iam delete-role --role-name kaniko-ecr-push-role || true
-          # Set ROLE_EXISTS to false to recreate it
-          ROLE_EXISTS="false"
-          echo "Waiting for role deletion to propagate..."
-          sleep 10
+        # Get OIDC provider ID from EKS cluster
+        OIDC_PROVIDER_ID=$(aws eks describe-cluster --name $EKS_CLUSTER_NAME --query "cluster.identity.oidc.issuer" --output text | cut -d'/' -f5)
+        echo "OIDC Provider ID: $OIDC_PROVIDER_ID"
+        
+        # Check if OIDC provider exists
+        OIDC_PROVIDER_EXISTS=$(aws iam list-open-id-connect-providers | grep $OIDC_PROVIDER_ID || echo "false")
+        
+        if [ "$OIDC_PROVIDER_EXISTS" = "false" ]; then
+          echo "OIDC provider does not exist. Creating it..."
+          eksctl utils associate-iam-oidc-provider --cluster $EKS_CLUSTER_NAME --approve
+        else
+          echo "OIDC provider already exists"
         fi
         
-        if [ "$ROLE_EXISTS" = "false" ]; then
-          echo "Creating kaniko-ecr-push-role for IRSA..."
-          # Get OIDC provider ID
-          OIDC_PROVIDER_ID=$(aws eks describe-cluster --name $EKS_CLUSTER_NAME --query "cluster.identity.oidc.issuer" --output text | cut -d'/' -f5)
-          
-          # Check if OIDC provider exists
-          OIDC_PROVIDER_EXISTS=$(aws iam list-open-id-connect-providers | grep $OIDC_PROVIDER_ID || echo "false")
-          
-          if [ "$OIDC_PROVIDER_EXISTS" = "false" ]; then
-            echo "OIDC provider does not exist. Creating it..."
-            eksctl utils associate-iam-oidc-provider --cluster $EKS_CLUSTER_NAME --approve
-          else
-            echo "OIDC provider already exists"
-          fi
-          
-          # Create trust policy
-          cat > /tmp/trust-policy.json << EOF
+        # Create trust policy for IRSA - simplified to match what works manually
+        echo "Creating trust policy for IRSA..."
+        cat > /tmp/kaniko-trust-policy.json << EOF
         {
           "Version": "2012-10-17",
           "Statement": [
@@ -106,7 +85,6 @@ phases:
               "Action": "sts:AssumeRoleWithWebIdentity",
               "Condition": {
                 "StringEquals": {
-                  "oidc.eks.$AWS_REGION.amazonaws.com/id/$OIDC_PROVIDER_ID:aud": "sts.amazonaws.com",
                   "oidc.eks.$AWS_REGION.amazonaws.com/id/$OIDC_PROVIDER_ID:sub": "system:serviceaccount:default:kaniko-builder"
                 }
               }
@@ -114,18 +92,19 @@ phases:
           ]
         }
         EOF
-          
-          # Create role
-          aws iam create-role --role-name kaniko-ecr-push-role --assume-role-policy-document file:///tmp/trust-policy.json
-          
-          # Attach policies
-          aws iam attach-role-policy --role-name kaniko-ecr-push-role --policy-arn arn:aws:iam::aws:policy/AmazonECR-FullAccess
-          aws iam attach-role-policy --role-name kaniko-ecr-push-role --policy-arn arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
-          
-          echo "kaniko-ecr-push-role created successfully"
-        else
-          echo "kaniko-ecr-push-role already exists"
-        fi
+        
+        # Create or update the IAM role
+        echo "Creating or updating IAM role..."
+        aws iam create-role --role-name kaniko-ecr-push-role --assume-role-policy-document file:///tmp/kaniko-trust-policy.json || aws iam update-assume-role-policy --role-name kaniko-ecr-push-role --policy-document file:///tmp/kaniko-trust-policy.json
+        
+        # Attach policies to the role - using AWS managed policies that are known to work
+        echo "Attaching policies to the role..."
+        aws iam attach-role-policy --role-name kaniko-ecr-push-role --policy-arn arn:aws:iam::aws:policy/AmazonECR-FullAccess || true
+        aws iam attach-role-policy --role-name kaniko-ecr-push-role --policy-arn arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess || true
+        
+        # Verify the role and its trust policy
+        echo "Verifying IAM role and trust policy..."
+        aws iam get-role --role-name kaniko-ecr-push-role --query 'Role.AssumeRolePolicyDocument' --output json
       - echo "Checking if ECR repositories exist..."
       - |
         # Check if streamlit-app repository exists
@@ -156,11 +135,41 @@ phases:
       - kubectl apply -f kubernetes/kaniko-pod-updated.yaml
       - echo "Verifying pod configuration..."
       - kubectl get pod ${APP_NAME}-kaniko-builder -o yaml
+      - echo "Checking pod environment variables..."
+      - kubectl exec ${APP_NAME}-kaniko-builder -c kaniko -- env || echo "Could not check environment variables, pod may not be ready yet"
+      - echo "Checking service account token mount..."
+      - kubectl exec ${APP_NAME}-kaniko-builder -c kaniko -- ls -la /var/run/secrets/eks.amazonaws.com/serviceaccount/ || echo "Could not check token mount, pod may not be ready yet"
       - echo "Waiting for Kaniko pod to complete..."
       - kubectl wait --for=condition=Ready pod/${APP_NAME}-kaniko-builder --timeout=60s || true
-      - kubectl logs -f ${APP_NAME}-kaniko-builder
+      - kubectl logs -f ${APP_NAME}-kaniko-builder || true
       - echo "Waiting for Kaniko build to complete..."
-      - until kubectl get pod ${APP_NAME}-kaniko-builder -o jsonpath='{.status.phase}' | grep -q "Succeeded"; do sleep 5; done
+      - |
+        # Wait for the pod to complete with a timeout
+        TIMEOUT=300
+        START_TIME=$(date +%s)
+        while true; do
+          POD_STATUS=$(kubectl get pod ${APP_NAME}-kaniko-builder -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
+          CURRENT_TIME=$(date +%s)
+          ELAPSED_TIME=$((CURRENT_TIME - START_TIME))
+          
+          if [ "$POD_STATUS" = "Succeeded" ]; then
+            echo "Build succeeded!"
+            break
+          elif [ "$POD_STATUS" = "Failed" ]; then
+            echo "Build failed! Checking logs..."
+            kubectl logs ${APP_NAME}-kaniko-builder
+            kubectl describe pod ${APP_NAME}-kaniko-builder
+            exit 1
+          elif [ $ELAPSED_TIME -gt $TIMEOUT ]; then
+            echo "Build timed out after $TIMEOUT seconds!"
+            kubectl logs ${APP_NAME}-kaniko-builder
+            kubectl describe pod ${APP_NAME}-kaniko-builder
+            exit 1
+          fi
+          
+          echo "Waiting for build to complete... Current status: $POD_STATUS, elapsed time: $ELAPSED_TIME seconds"
+          sleep 5
+        done
 
   post_build:
     commands:
