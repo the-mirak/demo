@@ -80,6 +80,7 @@ aws sts get-caller-identity
 Create an S3 bucket to store your application build contexts:
 
 ```bash
+#export S3_BUCKET=streamlitappdemo
 export S3_BUCKET=your-unique-bucket-name
 aws s3 mb s3://$S3_BUCKET
 ```
