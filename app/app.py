@@ -4,7 +4,7 @@ import numpy as np
 
 # Set page title and configuration
 st.set_page_config(
-    page_title="AWS EKS Demo App v1",
+    page_title="AWS EKS Demo App v1.1",
     page_icon="🚀",
     layout="wide"
 )
