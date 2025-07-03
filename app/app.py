@@ -10,7 +10,7 @@ st.set_page_config(
 )
 
 # App header
-st.title("🚀 Streamlit App on AWS EKS Demo ... from CA !!!!")
+st.title("🚀 Streamlit App on AWS EKS Demo ... from Safran !!!!")
 st.markdown("### Deployed with Kaniko on Amazon EKS")
 
 # Sidebar
