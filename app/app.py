@@ -4,13 +4,13 @@ import numpy as np
 
 # Set page title and configuration
 st.set_page_config(
-    page_title="AWS EKS Demo App v1.2",
+    page_title="AWS EKS Demo App v1.3",
     page_icon="🚀",
     layout="wide"
 )
 
 # App header
-st.title("🚀 Streamlit App on AWS EKS Demo ... from Safran !!!!")
+st.title("🚀 Streamlit App on AWS EKS Demo ... from vILT !!!!")
 st.markdown("### Deployed with Kaniko on Amazon EKS")
 
 # Sidebar
